@@ -76,6 +76,7 @@ class SupabaseStateStore:
         self._timeout_s = timeout_s
         self._client = client
         self._owns_client = client is None
+        self._client_loop: asyncio.AbstractEventLoop | None = None
 
     @property
     def endpoint(self) -> str:
@@ -92,37 +93,86 @@ class SupabaseStateStore:
         }
 
     async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
+        """Return an owned client bound to the *running* event loop.
+
+        The gateway restores mirrored state with ``asyncio.run(...)`` before its
+        own loop exists, so a client created there (and the connections pooled
+        inside it) outlives the loop it was built on. Reusing that pool from the
+        gateway loop raises ``RuntimeError: Event loop is closed`` from deep
+        inside httpcore — a non-``httpx`` error that used to escape the snapshot
+        task and take the whole gateway down. Rebuilding whenever the loop
+        changes keeps every request on a live pool.
+        """
+        if self._owns_client:
+            loop = asyncio.get_running_loop()
+            if self._client is not None and self._client_loop is not loop:
+                await self._reset_client()
+            if self._client is None:
+                self._client = httpx.AsyncClient(timeout=self._timeout_s)
+            self._client_loop = loop
+        elif self._client is None:  # pragma: no cover - defensive
             self._client = httpx.AsyncClient(timeout=self._timeout_s)
             self._owns_client = True
         return self._client
 
+    async def _reset_client(self) -> None:
+        """Discard an owned client so the next call rebuilds it on this loop."""
+        if self._client is None or not self._owns_client:
+            return
+        stale = self._client
+        self._client = None
+        self._client_loop = None
+        try:
+            await stale.aclose()
+        except Exception as exc:  # pragma: no cover - stale-loop teardown
+            logger.debug("Supabase mirror: discarded unusable HTTP client ({})", exc)
+
     async def aclose(self) -> None:
         """Close the HTTP client when this store owns it."""
         if self._client is not None and self._owns_client:
-            await self._client.aclose()
-            self._client = None
+            await self._reset_client()
 
     async def _request(self, method: str, **kwargs: Any) -> httpx.Response:
-        client = await self._get_client()
-        try:
-            response = await client.request(
-                method,
-                self.endpoint,
-                headers={**self._headers, **kwargs.pop("headers", {})},
-                **kwargs,
-            )
-        except httpx.HTTPError as exc:  # network / DNS / timeout
-            raise SupabasePersistenceError(
-                f"Supabase {method} {self._table} failed: {exc}"
-            ) from exc
+        headers = {**self._headers, **kwargs.pop("headers", {})}
+        # One retry, but only for a client this store owns: a transport error can
+        # come from a pool that is no longer usable, and the retry runs against a
+        # freshly built one. An injected client (tests) is never rebuilt.
+        attempts = 2 if self._owns_client else 1
+        for attempt in range(1, attempts + 1):
+            client = await self._get_client()
+            try:
+                response = await client.request(
+                    method,
+                    self.endpoint,
+                    headers=headers,
+                    **kwargs,
+                )
+            except (httpx.HTTPError, RuntimeError) as exc:
+                # httpx.HTTPError: network / DNS / timeout.
+                # RuntimeError: pooled connection bound to a dead event loop.
+                await self._reset_client()
+                if attempt < attempts:
+                    logger.debug(
+                        "Supabase {} {} failed ({}); retrying on a fresh client",
+                        method,
+                        self._table,
+                        exc,
+                    )
+                    continue
+                raise SupabasePersistenceError(
+                    f"Supabase {method} {self._table} failed: {exc}"
+                ) from exc
 
-        if response.status_code >= 400:
-            raise SupabasePersistenceError(
-                f"Supabase {method} {self._table} returned HTTP {response.status_code}: "
-                f"{response.text[:400]}"
-            )
-        return response
+            if response.status_code >= 400:
+                raise SupabasePersistenceError(
+                    f"Supabase {method} {self._table} returned HTTP {response.status_code}: "
+                    f"{response.text[:400]}"
+                )
+            return response
+
+        raise SupabasePersistenceError(  # pragma: no cover - loop always returns/raises
+            f"Supabase {method} {self._table} failed: no attempt completed"
+        )
 
     async def pull(self, key: str) -> dict[str, Any] | None:
         """Return the stored payload for ``key``, or None when absent."""
@@ -264,13 +314,18 @@ class WorkspaceStateMirror:
                 await asyncio.sleep(interval_s)
                 await self.snapshot()
             except asyncio.CancelledError:
-                with_final_error = None
+                with_final_error: BaseException | None = None
                 try:
                     await self.snapshot()
-                except SupabasePersistenceError as exc:  # pragma: no cover - shutdown path
+                except Exception as exc:  # pragma: no cover - shutdown path
                     with_final_error = exc
                 if with_final_error is not None:  # pragma: no cover - shutdown path
                     logger.error("Supabase mirror: final snapshot failed: {}", with_final_error)
                 raise
             except SupabasePersistenceError as exc:
                 logger.error("Supabase mirror: snapshot cycle failed: {}", exc)
+            except Exception as exc:
+                # Last line of defence: the mirror is a convenience, so no
+                # unexpected error from it may ever reach the gateway's task
+                # group and stop the agent, its channels, or its cron jobs.
+                logger.error("Supabase mirror: unexpected snapshot error: {}", exc)

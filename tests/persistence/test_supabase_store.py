@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -273,3 +274,88 @@ class TestWorkspaceMirror:
     def test_paths_are_normalised(self, tmp_path: Path) -> None:
         mirror = self._mirror(tmp_path, _Recorder(), paths=["/cron/jobs.json", "  ", "sessions.json"])
         assert mirror.paths == ["cron/jobs.json", "sessions.json"]
+
+
+class TestEventLoopResilience:
+    """Regression cover for the crash that killed the deployed gateway.
+
+    The gateway restores mirrored state with ``asyncio.run(...)`` before its own
+    loop exists, then snapshots from the gateway loop. A client pooled on the
+    first (now closed) loop raised ``RuntimeError: Event loop is closed`` out of
+    httpcore — not an ``httpx.HTTPError`` — which escaped the snapshot task and
+    stopped the agent, its Telegram channel, and its cron jobs every cycle.
+    """
+
+    def test_owned_client_is_rebuilt_for_each_event_loop(self, tmp_path: Path) -> None:
+        state = {"jobs": [{"id": "declared:daily-brief"}]}
+        target = tmp_path / "cron" / "jobs.json"
+        target.parent.mkdir(parents=True)
+        target.write_text(json.dumps(state), encoding="utf-8")
+
+        seen: list[int] = []
+
+        store = SupabaseStateStore(url=_URL, service_key=_KEY, table=_TABLE)
+
+        async def _capture_client() -> int:
+            client = await store._get_client()  # noqa: SLF001 - loop binding is the contract
+            return id(client)
+
+        # Two separate asyncio.run calls == two distinct, sequentially closed loops.
+        seen.append(asyncio.run(_capture_client()))
+        seen.append(asyncio.run(_capture_client()))
+
+        assert seen[0] != seen[1], "a client pooled on a closed loop must not be reused"
+
+    @pytest.mark.asyncio
+    async def test_runtime_error_from_dead_pool_is_retried_then_wrapped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[str] = []
+
+        def _dead_loop(request: httpx.Request) -> httpx.Response:
+            calls.append(request.url.path)
+            raise RuntimeError("Event loop is closed")
+
+        real_client = httpx.AsyncClient
+
+        def _mocked_client(**kwargs: object) -> httpx.AsyncClient:
+            kwargs.pop("transport", None)
+            return real_client(transport=httpx.MockTransport(_dead_loop), **kwargs)  # type: ignore[arg-type]
+
+        # The rebuilt client must stay offline too, so the assertion sees the
+        # wrapped RuntimeError rather than a DNS error from a real connection.
+        monkeypatch.setattr(httpx, "AsyncClient", _mocked_client)
+
+        store = SupabaseStateStore(url=_URL, service_key=_KEY, table=_TABLE)
+        store._client = _mocked_client()  # noqa: SLF001
+        store._owns_client = True  # noqa: SLF001
+        store._client_loop = asyncio.get_running_loop()  # noqa: SLF001
+
+        # Never a bare RuntimeError escaping to the caller's task group.
+        with pytest.raises(SupabasePersistenceError, match="Event loop is closed"):
+            await store.push("cron/jobs.json", {"jobs": []})
+        assert len(calls) == 2, "an owned client gets exactly one retry on a fresh pool"
+
+    @pytest.mark.asyncio
+    async def test_snapshot_loop_survives_unexpected_errors(self, tmp_path: Path) -> None:
+        mirror = WorkspaceStateMirror(
+            store=_store(_Recorder()),
+            workspace_path=tmp_path,
+            paths=["cron/jobs.json"],
+        )
+        cycles = 0
+
+        async def _boom() -> list[str]:
+            nonlocal cycles
+            cycles += 1
+            raise RuntimeError("Event loop is closed")
+
+        mirror.snapshot = _boom  # type: ignore[method-assign]
+
+        task = asyncio.create_task(mirror.run_forever(0.01))
+        while cycles < 3:
+            await asyncio.sleep(0.01)
+        assert not task.done(), "the mirror must keep cycling instead of taking the process down"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
