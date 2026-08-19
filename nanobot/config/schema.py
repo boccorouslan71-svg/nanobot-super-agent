@@ -554,10 +554,23 @@ class SupabasePersistenceConfig(Base):
         return self
 
 
+class KeepaliveConfig(Base):
+    """Self-ping the service's own public URL so a free host never sleeps."""
+
+    enabled: bool = False
+    # Public base URL of this service. Left empty on Render: the platform
+    # injects RENDER_EXTERNAL_URL, which the runtime picks up automatically.
+    base_url: str | None = None
+    path: str = "/"  # Endpoint to request; any status code counts as traffic
+    interval_s: int = Field(default=300, ge=30)  # Must stay under the host's idle window
+    timeout_s: float = Field(default=30.0, gt=0)  # Generous: a cold start is slow
+
+
 class PersistenceConfig(Base):
     """Durable state mirrors for hosts without a persistent disk."""
 
     supabase: SupabasePersistenceConfig = Field(default_factory=SupabasePersistenceConfig)
+    keepalive: KeepaliveConfig = Field(default_factory=KeepaliveConfig)
 
 
 class Config(BaseSettings):

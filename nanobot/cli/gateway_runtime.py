@@ -322,6 +322,19 @@ def _build_state_mirror(config: Any) -> Any | None:
     )
 
 
+def _build_keepalive(config: Any) -> Any | None:
+    """Build the free-tier self-ping keepalive when it is configured.
+
+    Kept next to the state mirror because both exist for the same reason: a free
+    container host with no persistent disk and an idle-sleep policy.
+    """
+    import os
+
+    from nanobot.persistence import build_keepalive
+
+    return build_keepalive(config, environ=dict(os.environ))
+
+
 def _run_gateway(
     config: Config,
     *,
@@ -448,6 +461,12 @@ def _run_gateway(
     # On hosts without a persistent disk the workspace is empty on boot; the
     # mirror repopulates it so scheduled jobs and sessions survive a redeploy.
     state_mirror = _build_state_mirror(config)
+    keepalive = _build_keepalive(config)
+    if keepalive is not None:
+        console.print(
+            f"[green]✓[/green] Keepalive: {keepalive.url} "
+            f"every {keepalive.interval_s:.0f}s"
+        )
     if state_mirror is not None and config.persistence.supabase.restore_on_start:
         from nanobot.persistence import SupabasePersistenceError
 
@@ -972,6 +991,11 @@ def _run_gateway(
                 tasks.append(asyncio.create_task(
                     state_mirror.run_forever(config.persistence.supabase.snapshot_interval_s),
                     name="nanobot-supabase-mirror",
+                ))
+            if keepalive is not None:
+                tasks.append(asyncio.create_task(
+                    keepalive.run_forever(),
+                    name="nanobot-keepalive",
                 ))
             if health_server_enabled:
                 tasks.append(asyncio.create_task(

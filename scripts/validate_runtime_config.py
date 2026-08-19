@@ -146,6 +146,27 @@ check("mirror table", supabase.table, "nanobot_state_blobs")
 check("mirror paths", supabase.paths, ["cron/jobs.json"])
 check("mirror restores on start", supabase.restore_on_start, True)
 
+print("\n--- free-tier keepalive (anti-sleep self ping) ---")
+from nanobot.persistence import build_keepalive  # noqa: E402
+
+keepalive_cfg = config.persistence.keepalive
+check("keepalive enabled", keepalive_cfg.enabled, True)
+check("keepalive interval", keepalive_cfg.interval_s, 300)
+check("keepalive path", keepalive_cfg.path, "/")
+# baseUrl is intentionally unset in the template: Render injects the real public
+# URL at runtime, so the ping follows the service instead of a hardcoded host.
+check("keepalive base url unset in template", keepalive_cfg.base_url, None)
+
+built = build_keepalive(
+    config, environ={"RENDER_EXTERNAL_URL": "https://nanobot-abee.onrender.com"}
+)
+check("keepalive built from platform url", built is not None, True)
+if built is not None:
+    check("keepalive ping url", built.url, "https://nanobot-abee.onrender.com/")
+    check("keepalive interval under render's 15min idle window", built.interval_s < 900, True)
+# A host that injects nothing must degrade to "no keepalive", never crash boot.
+check("keepalive degrades without a public url", build_keepalive(config, environ={}), None)
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S):")

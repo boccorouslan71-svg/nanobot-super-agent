@@ -105,6 +105,12 @@
       ],
       "restoreOnStart": true,
       "snapshotIntervalS": 120
+    },
+    "keepalive": {
+      "enabled": true,
+      "path": "/",
+      "intervalS": 300,
+      "timeoutS": 30
     }
   }
 }

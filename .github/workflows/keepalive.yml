@@ -1,0 +1,65 @@
+# External keepalive — wakes the Render free instance every 5 minutes.
+#
+# Why two layers? The in-process keepalive (persistence.keepalive in
+# render-config.json) pings the service's own public URL from inside the
+# container, which defeats the idle timer while the instance runs. It cannot
+# help once the instance is already asleep — a sleeping container executes
+# nothing, so nothing pings.
+#
+# This workflow closes that hole from the outside: GitHub's scheduler is not
+# affected by Render's sleep state, so a cold instance is woken here and the
+# in-process ping keeps it awake between runs.
+#
+# Note: GitHub's cron is best-effort (5 min is the minimum interval and runs can
+# be delayed under load), which is exactly why it is the backup layer rather
+# than the primary one.
+name: keepalive
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never queue overlapping pings: a delayed run is worthless once the next
+  # one is due.
+  group: keepalive
+  cancel-in-progress: true
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping the deployed gateway
+        env:
+          # Override in repo settings (Variables → SERVICE_URL) if the service
+          # is renamed or moved; the default is the current deployment.
+          SERVICE_URL: ${{ vars.SERVICE_URL || 'https://nanobot-abee.onrender.com' }}
+        run: |
+          set -uo pipefail
+
+          # A sleeping free instance cold-starts in ~30-50s, so the first
+          # attempt is allowed to be slow, and a failure is retried rather
+          # than reported: transient edge errors are normal on free tiers.
+          for attempt in 1 2 3; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+                        --max-time 90 \
+                        -A 'nanobot-keepalive-ci/1.0' \
+                        "$SERVICE_URL/" || echo "000")
+            echo "attempt ${attempt}: HTTP ${code}"
+
+            # Any HTTP status means the request reached Render's router and the
+            # instance is awake — that is the only thing this job must achieve.
+            if [ "$code" != "000" ]; then
+              echo "Service reachable (HTTP ${code}); idle timer reset."
+              exit 0
+            fi
+            sleep 15
+          done
+
+          echo "::error::Service unreachable after 3 attempts — check the Render deployment."
+          exit 1
