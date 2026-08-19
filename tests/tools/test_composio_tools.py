@@ -303,6 +303,89 @@ async def test_execute_honours_per_call_user_id() -> None:
     assert fake.calls[0]["json"]["user_id"] == "someone-else"
 
 
+# --- facebook page publishing -----------------------------------------------
+
+_PAGES_PAYLOAD = {
+    "successful": True,
+    "data": {
+        "data": [
+            {"id": "1192699313930831", "name": "Maya Gold", "access_token": "page-token-abc"},
+            {"id": "1129160526949038", "name": "Kalza Officiel", "access_token": "page-token-xyz"},
+        ]
+    },
+}
+
+
+def _post_url_fake(posts: list[dict[str, Any]]) -> Any:
+    """Stand-in for the Graph API feed call; records every call made."""
+
+    async def _post(url: str, json_body: dict[str, Any]) -> dict[str, Any]:
+        posts.append(json_body)
+        return {"id": "1192699313930831_feed_1"}
+
+    return _post
+
+
+async def test_facebook_create_post_uses_the_page_access_token() -> None:
+    tool, fake = _tool(ComposioExecuteTool, [_PAGES_PAYLOAD])
+    posted: list[dict[str, Any]] = []
+    tool.client.post_url = _post_url_fake(posted)  # type: ignore[method-assign]
+
+    result = await tool.execute(
+        tool_slug="FACEBOOK_CREATE_POST",
+        arguments={"page_id": "1192699313930831", "message": "Bonjour la communaute"},
+    )
+
+    assert fake.calls[0]["path"] == "/tools/execute/FACEBOOK_GET_USER_PAGES"
+    assert fake.calls[0]["json"] == {"user_id": "owner", "arguments": {}}
+    assert len(posted) == 1  # the direct Graph API call received the page token
+    assert posted[0]["access_token"] == "page-token-abc"
+    assert posted[0]["message"] == "Bonjour la communaute"
+    # The token must never leak into the agent-facing output.
+    assert "page-token-abc" not in result
+    assert "1192699313930831_feed_1" in result
+
+
+async def test_facebook_create_post_requires_a_page_id() -> None:
+    tool, fake = _tool(ComposioExecuteTool, [])
+
+    result = await tool.execute(tool_slug="FACEBOOK_CREATE_POST", arguments={"message": "hi"})
+
+    assert result.is_error
+    assert "page_id" in result
+    assert not fake.calls
+
+
+async def test_facebook_create_post_errors_when_page_is_not_managed() -> None:
+    tool, fake = _tool(ComposioExecuteTool, [_PAGES_PAYLOAD])
+
+    result = await tool.execute(
+        tool_slug="FACEBOOK_CREATE_POST",
+        arguments={"page_id": "999999999", "message": "hello"},
+    )
+
+    assert result.is_error
+    assert "No Page access token" in result
+    assert len(fake.calls) == 1
+
+
+async def test_facebook_create_post_surfaces_graph_api_errors() -> None:
+    tool, fake = _tool(ComposioExecuteTool, [_PAGES_PAYLOAD])
+
+    async def _boom(url: str, json_body: dict[str, Any]) -> dict[str, Any]:
+        raise ComposioError("HTTP 400: bad")
+
+    tool.client.post_url = _boom  # type: ignore[method-assign]
+
+    result = await tool.execute(
+        tool_slug="FACEBOOK_CREATE_POST",
+        arguments={"page_id": "1192699313930831", "message": "hello"},
+    )
+
+    assert getattr(result, "is_error", False)
+    assert "FACEBOOK_CREATE_POST failed" in str(result)
+
+
 # --- connect ----------------------------------------------------------------
 
 

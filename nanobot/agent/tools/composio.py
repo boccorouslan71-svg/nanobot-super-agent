@@ -45,6 +45,8 @@ if TYPE_CHECKING:
 _DEFAULT_BASE_URL = "https://backend.composio.dev/api/v3"
 _API_KEY_ENV = "COMPOSIO_API_KEY"
 _MAX_RESULT_CHARS = 6000
+_FACEBOOK_GRAPH_BASE = "https://graph.facebook.com/v20.0"
+_FACEBOOK_CREATE_POST = "FACEBOOK_CREATE_POST"
 
 
 class ComposioToolsConfig(Base):
@@ -132,6 +134,28 @@ class _ComposioClient:
                 message = str(error or payload)[:400]
             raise ComposioError(f"HTTP {response.status_code} from Composio ({path}): {message}")
 
+        return payload
+
+    async def post_url(self, url: str, json_body: dict[str, Any]) -> dict[str, Any]:
+        """POST to an arbitrary URL (outside this client's base) and parse JSON.
+
+        Used by the Facebook page-token path: the Graph API is reached directly
+        with a page access token, bypassing the connection's user-level token.
+        """
+        client_kwargs: dict[str, Any] = {"timeout": self._config.timeout}
+        if self._config.proxy:
+            client_kwargs["proxy"] = self._config.proxy
+
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            response = await client.post(url, json=json_body)
+
+        try:
+            payload = cast(dict[str, Any], response.json())
+        except ValueError as exc:  # non-JSON body: surface status and raw text
+            raise ComposioError(f"HTTP {response.status_code} from Facebook ({url}): {response.text[:300]}") from exc
+        if response.status_code >= 400:
+            message = str(payload.get("error") or payload)[:400]
+            raise ComposioError(f"HTTP {response.status_code} from Facebook ({url}): {message}")
         return payload
 
     @staticmethod
@@ -354,6 +378,14 @@ class ComposioExecuteTool(_ComposioTool):
             return ToolResult.error("'arguments' must be a JSON object.")
         user_id = self._user_id(kwargs.get("user_id"))
 
+        # FACEBOOK_CREATE_POST is special-cased: Composio authenticates it with
+        # the connection's user-level token, which the modern Facebook Pages API
+        # rejects (#200) when posting to a managed Page. Routing it instead
+        # through the Page's own access token (fetched via GET_USER_PAGES, which
+        # returns per-Page admin tokens) makes publishing work for the owner.
+        if tool_slug == _FACEBOOK_CREATE_POST:
+            return await self._guarded(self._facebook_create_post(user_id, raw_args))
+
         async def _run() -> Any:
             payload = await self.client.request(
                 "POST",
@@ -370,6 +402,51 @@ class ComposioExecuteTool(_ComposioTool):
             return ToolResult.error(f"{tool_slug} failed: {error}.{hint}")
 
         return await self._guarded(_run())
+
+    async def _facebook_create_post(self, user_id: str, args: dict[str, Any]) -> Any:
+        """Publish to a Facebook Page using the Page's own access token."""
+        page_id = str(args.get("page_id") or "").strip()
+        if not page_id:
+            return ToolResult.error("'page_id' is required to publish on Facebook.")
+
+        try:
+            pages_payload = await self.client.request(
+                "POST",
+                "/tools/execute/FACEBOOK_GET_USER_PAGES",
+                json_body={"user_id": user_id, "arguments": {}},
+            )
+        except ComposioError as exc:
+            return ToolResult.error(f"Could not list Facebook pages to publish: {exc}")
+
+        page_token = None
+        root = pages_payload.get("data")
+        if isinstance(root, dict):
+            pages = root.get("data", [])
+        else:
+            pages = []
+        for page in pages if isinstance(pages, list) else []:
+            if str(page.get("id")) == page_id:
+                page_token = page.get("access_token")
+                break
+        if not page_token:
+            return ToolResult.error(
+                f"No Page access token found for Facebook page '{page_id}' for user '{user_id}'. "
+                "Make sure the connected account manages this page, then retry."
+            )
+
+        feed_body: dict[str, Any] = {"access_token": page_token}
+        if args.get("message"):
+            feed_body["message"] = str(args["message"]).strip()
+        if args.get("link"):
+            feed_body["link"] = str(args["link"]).strip()
+        try:
+            result = await self.client.post_url(
+                f"{_FACEBOOK_GRAPH_BASE}/{page_id}/feed",
+                feed_body,
+            )
+        except ComposioError as exc:
+            return ToolResult.error(f"{_FACEBOOK_CREATE_POST} failed: {exc}")
+        return _truncate(result)
 
 
 @tool_parameters(
