@@ -71,7 +71,7 @@ primary = ModelPresetConfig(
 )
 chain = _resolve_fallback_presets(config, primary)
 resolved = [f"{p.provider}/{p.model}" for p in chain]
-check("fallback chain", resolved, ["gemini/gemini-2.5-flash", "gemini/gemini-2.5-pro"])
+check("fallback chain", resolved, ["gemini/gemini-3.6-flash", "gemini/gemini-3.5-flash"])
 
 print("\n--- telegram allowlist semantics (owner-only) ---")
 # Exercised through the shared channel authorization path (BaseChannel), so the

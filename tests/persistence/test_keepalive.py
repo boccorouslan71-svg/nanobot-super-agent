@@ -119,12 +119,14 @@ class TestPing:
     def test_owned_client_is_rebuilt_for_each_event_loop(self) -> None:
         keepalive = SelfPingKeepalive(base_url=_PUBLIC)
 
-        async def _capture() -> int:
-            return id(await keepalive._get_client())  # noqa: SLF001 - loop binding is the contract
+        # Compare object identity, not id(): a freed client's address can be
+        # reused by the next allocation, which makes an id() check flaky.
+        async def _capture() -> httpx.AsyncClient:
+            return await keepalive._get_client()  # noqa: SLF001 - loop binding is the contract
 
         first = asyncio.run(_capture())
         second = asyncio.run(_capture())
-        assert first != second
+        assert first is not second
 
 
 class TestRunForever:

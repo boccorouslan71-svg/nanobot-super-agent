@@ -292,19 +292,21 @@ class TestEventLoopResilience:
         target.parent.mkdir(parents=True)
         target.write_text(json.dumps(state), encoding="utf-8")
 
-        seen: list[int] = []
+        # Hold real references, never id() values: a discarded client can be
+        # collected and the next allocation can land on the same address, which
+        # made an id()-based assertion flaky under a full-suite run.
+        seen: list[httpx.AsyncClient] = []
 
         store = SupabaseStateStore(url=_URL, service_key=_KEY, table=_TABLE)
 
-        async def _capture_client() -> int:
-            client = await store._get_client()  # noqa: SLF001 - loop binding is the contract
-            return id(client)
+        async def _capture_client() -> httpx.AsyncClient:
+            return await store._get_client()  # noqa: SLF001 - loop binding is the contract
 
         # Two separate asyncio.run calls == two distinct, sequentially closed loops.
         seen.append(asyncio.run(_capture_client()))
         seen.append(asyncio.run(_capture_client()))
 
-        assert seen[0] != seen[1], "a client pooled on a closed loop must not be reused"
+        assert seen[0] is not seen[1], "a client pooled on a closed loop must not be reused"
 
     @pytest.mark.asyncio
     async def test_runtime_error_from_dead_pool_is_retried_then_wrapped(

@@ -7,12 +7,12 @@
       "contextWindowTokens": 200000,
       "fallbackModels": [
         {
-          "model": "gemini-2.5-flash",
+          "model": "gemini-3.6-flash",
           "provider": "gemini",
           "maxTokens": 16384
         },
         {
-          "model": "gemini-2.5-pro",
+          "model": "gemini-3.5-flash",
           "provider": "gemini",
           "maxTokens": 16384
         }
