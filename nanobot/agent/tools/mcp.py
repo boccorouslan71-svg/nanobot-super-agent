@@ -1380,6 +1380,10 @@ class MCPProvider:
         self._runtime_statuses: dict[str, MCPRuntimeStatus] = {}
         self._lock = asyncio.Lock()
         self._closing = False
+        # One bounded recovery task and one keepalive task per server. Both are
+        # owned here so aclose() can cancel them deterministically.
+        self._recovery_tasks: dict[str, asyncio.Task[None]] = {}
+        self._keepalive_tasks: dict[str, asyncio.Task[None]] = {}
 
     @classmethod
     def from_config(
@@ -1625,12 +1629,201 @@ class MCPProvider:
             )
 
         for server_name in server_names:
+            # Every successful (re)connection path funnels through here, so this is
+            # also where the session keepalive is (re)armed.
+            self._start_keepalive(server_name)
             for tool_name in list(self._registry.tool_names):
                 tool = self._registry.get(tool_name)
                 if not _tool_belongs_to_server(tool, tool_name, server_name):
                     continue
                 if isinstance(tool, _MCPWrapperBase):
                     tool.set_reconnect_handler(reconnect)
+
+    async def _stage_connect(
+        self,
+        server_name: str,
+        cfg: MCPServerConfig,
+    ) -> tuple[dict[str, MCPConnection], ToolRegistry]:
+        """Connect one server into a throwaway registry.
+
+        The staging registry is the whole point: connect_mcp_servers() registers
+        wrappers as a side effect, so connecting straight into the live registry
+        forces callers to unregister first and lose every tool when the attempt
+        fails. Staging keeps the failure path free of visible side effects.
+        """
+        staged = ToolRegistry()
+        connected = await connect_mcp_servers({server_name: cfg}, staged)
+        return connected, staged
+
+    async def _adopt_staged_server(
+        self,
+        server_name: str,
+        connected: Mapping[str, MCPConnection],
+        staged: ToolRegistry,
+    ) -> int:
+        """Swap a proven replacement session in, retiring the stale one."""
+        await self._close_server(server_name)
+        _unregister_server_tools(self._registry, server_name)
+        adopted = 0
+        for tool_name in list(staged.tool_names):
+            tool = staged.get(tool_name)
+            if tool is None:
+                continue
+            self._registry.register(tool)
+            adopted += 1
+        self._connections.update(connected)
+        self._record_connection_result({server_name}, connected)
+        self._attach_reconnect_handlers(connected)
+        return adopted
+
+    def _schedule_recovery(self, server_name: str) -> None:
+        """Arm the bounded background retry loop for a server that is down."""
+        if self._closing:
+            return
+        existing = self._recovery_tasks.get(server_name)
+        if existing is not None and not existing.done():
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No loop (sync caller / teardown): background retry is unavailable,
+            # but the tools stay registered so the next call still retries.
+            return
+        self._recovery_tasks[server_name] = asyncio.create_task(
+            self._recover_server(server_name),
+            name=f"mcp-recover-{server_name}",
+        )
+
+    async def _recover_server(self, server_name: str) -> None:
+        """Retry a dead server with exponential backoff, bounded by attempts.
+
+        Tools are never unregistered here: a server that stays down keeps its
+        registrations so the agent's next call retries instead of the tool
+        silently vanishing until a process restart.
+        """
+        delay = _MCP_RECOVERY_MIN_DELAY_S
+        for attempt in range(1, _MCP_RECOVERY_MAX_ATTEMPTS + 1):
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                raise
+            if self._closing:
+                return
+            try:
+                async with self._lock:
+                    if self._closing or server_name in self._connections:
+                        return
+                    cfg = self._servers.get(server_name)
+                    if cfg is None:
+                        return
+                    connected, staged = await self._stage_connect(server_name, cfg)
+                    if self._closing:
+                        await _close_mcp_connections(connected)
+                        return
+                    if server_name in connected:
+                        adopted = await self._adopt_staged_server(
+                            server_name, connected, staged
+                        )
+                        logger.info(
+                            "MCP server '{}' recovered on attempt {} with {} tool(s)",
+                            server_name,
+                            attempt,
+                            adopted,
+                        )
+                        return
+                    await _close_mcp_connections(connected)
+                    self._set_runtime_status({server_name}, "failed")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a retry loop must not die
+                logger.warning(
+                    "MCP server '{}' recovery attempt {} raised: {}",
+                    server_name,
+                    attempt,
+                    exc,
+                )
+            delay = min(delay * 2, _MCP_RECOVERY_MAX_DELAY_S)
+        logger.warning(
+            "MCP server '{}' did not recover after {} attempts; its tools stay "
+            "registered and will retry on next use or config reload",
+            server_name,
+            _MCP_RECOVERY_MAX_ATTEMPTS,
+        )
+
+    def _server_session(self, server_name: str) -> Any | None:
+        """Return a live session for one server, borrowed from any of its wrappers."""
+        for tool_name in list(self._registry.tool_names):
+            tool = self._registry.get(tool_name)
+            if not isinstance(tool, _MCPWrapperBase):
+                continue
+            if getattr(tool, "_server_name", None) != server_name:
+                continue
+            session = getattr(tool, "_session", None)
+            if session is not None:
+                return session
+        return None
+
+    def _start_keepalive(self, server_name: str) -> None:
+        if self._closing or _MCP_PING_INTERVAL_S <= 0:
+            return
+        existing = self._keepalive_tasks.get(server_name)
+        if existing is not None and not existing.done():
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # Sync caller (or interpreter teardown): nothing to keep alive yet.
+            # The next successful connect inside a loop arms the ping.
+            return
+        self._keepalive_tasks[server_name] = asyncio.create_task(
+            self._keepalive_loop(server_name),
+            name=f"mcp-keepalive-{server_name}",
+        )
+
+    async def _keepalive_loop(self, server_name: str) -> None:
+        """Ping an idle server so remote hosts do not reap the session.
+
+        Detecting death here — rather than on the user's next tool call — is what
+        turns a silent disappearance into a background reconnect.
+        """
+        while not self._closing:
+            try:
+                await asyncio.sleep(_MCP_PING_INTERVAL_S)
+            except asyncio.CancelledError:
+                raise
+            if self._closing or server_name not in self._connections:
+                return
+            session = self._server_session(server_name)
+            send_ping = getattr(session, "send_ping", None)
+            if send_ping is None:
+                return
+            try:
+                await asyncio.wait_for(send_ping(), timeout=_MCP_PING_TIMEOUT_S)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - any failure means "reconnect"
+                logger.warning(
+                    "MCP server '{}' keepalive ping failed ({}); reconnecting",
+                    server_name,
+                    exc,
+                )
+                async with self._lock:
+                    if self._closing:
+                        return
+                    await self._close_server(server_name)
+                    self._set_runtime_status({server_name}, "failed")
+                self._schedule_recovery(server_name)
+                return
+
+    async def _cancel_background_tasks(self) -> None:
+        tasks = [*self._recovery_tasks.values(), *self._keepalive_tasks.values()]
+        self._recovery_tasks.clear()
+        self._keepalive_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(BaseException):
+                await task
 
     async def _refresh_terminated_server(
         self,
@@ -1658,29 +1851,30 @@ class MCPProvider:
                 return current_tool
 
             logger.warning(
-                "MCP server '{}' session terminated; refreshing connection",
+                "MCP server '{}' session terminated; opening a replacement session "
+                "while its tools stay registered",
                 server_name,
             )
-            _unregister_server_tools(self._registry, server_name)
-            await self._close_server(server_name)
-
             self._set_runtime_status({server_name}, "connecting")
-            connected = await connect_mcp_servers(
-                {server_name: cfg},
-                self._registry,
-            )
+            connected, staged = await self._stage_connect(server_name, cfg)
             if self._closing:
                 await _close_mcp_connections(connected)
                 return None
-            self._connections.update(connected)
-            self._record_connection_result({server_name}, connected)
-            self._attach_reconnect_handlers(connected)
             if server_name not in connected:
+                await _close_mcp_connections(connected)
+                # The old session is what terminated, so its handle is dead:
+                # release it (tools stay registered) or the recovery loop would
+                # see the server as still connected and never retry.
+                await self._close_server(server_name)
+                self._set_runtime_status({server_name}, "failed")
                 logger.warning(
-                    "MCP server '{}' reconnect failed after session termination",
+                    "MCP server '{}' reconnect failed; existing tools stay "
+                    "registered and bounded recovery is scheduled",
                     server_name,
                 )
+                self._schedule_recovery(server_name)
                 return None
+            await self._adopt_staged_server(server_name, connected, staged)
             return self._registry.get(tool_name)
 
     async def _close_server(self, server_name: str) -> None:
@@ -1692,6 +1886,7 @@ class MCPProvider:
     async def aclose(self) -> None:
         """Close every connection while excluding reconnect and hot reload."""
         self._closing = True
+        await self._cancel_background_tasks()
         async with self._lock:
             connections = dict(self._connections)
             self._connections.clear()
