@@ -45,6 +45,29 @@ class SupabasePersistenceError(RuntimeError):
     """Raised when the Supabase state mirror cannot complete an operation."""
 
 
+_DATA_DIR_PREFIX = "data:"
+
+
+def _normalize_mirror_path(raw: str) -> str:
+    """Normalize one configured mirror entry, keeping its root marker.
+
+    Two roots exist because not all restart-critical state lives in the
+    workspace: ``cron/jobs.json`` does, while MCP OAuth credentials live under
+    the instance data directory. A ``data:`` prefix selects the latter, so an
+    entry that is silently resolved against the wrong root — and would mirror
+    nothing at all — is impossible to configure by accident.
+    """
+    value = raw.strip()
+    if value.startswith(_DATA_DIR_PREFIX):
+        rel = value[len(_DATA_DIR_PREFIX) :].strip().lstrip("/")
+        if not rel:
+            raise SupabasePersistenceError(
+                f"mirror path {raw!r} names no file after the 'data:' prefix"
+            )
+        return f"{_DATA_DIR_PREFIX}{rel}"
+    return value.lstrip("/")
+
+
 def _content_hash(payload: Any) -> str:
     """Return a stable hash of a JSON-serialisable payload."""
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -225,12 +248,25 @@ class WorkspaceStateMirror:
         workspace_path: Path,
         paths: list[str],
         namespace: str = "workspace",
+        data_path: Path | None = None,
     ) -> None:
         self._store = store
         self._workspace_path = Path(workspace_path)
-        self._paths = [p.strip().lstrip("/") for p in paths if p and p.strip()]
+        self._data_path = Path(data_path) if data_path is not None else None
+        self._paths = [_normalize_mirror_path(p) for p in paths if p and p.strip()]
         self._namespace = namespace.strip("/") or "workspace"
         self._hashes: dict[str, str] = {}
+        # Fail at construction, not on the first snapshot: a 'data:' entry that
+        # cannot be resolved would otherwise be skipped silently for the whole
+        # process lifetime, which is exactly the "credentials were never
+        # mirrored" failure this class exists to prevent.
+        if self._data_path is None:
+            unresolvable = [p for p in self._paths if p.startswith(_DATA_DIR_PREFIX)]
+            if unresolvable:
+                raise SupabasePersistenceError(
+                    "mirror paths reference the data directory but no data_path "
+                    f"was provided: {', '.join(unresolvable)}"
+                )
 
     @property
     def paths(self) -> list[str]:
@@ -238,9 +274,17 @@ class WorkspaceStateMirror:
         return list(self._paths)
 
     def _row_key(self, rel_path: str) -> str:
+        if rel_path.startswith(_DATA_DIR_PREFIX):
+            return f"{self._namespace}/data/{rel_path[len(_DATA_DIR_PREFIX) :]}"
         return f"{self._namespace}/{rel_path}"
 
     def _local_path(self, rel_path: str) -> Path:
+        if rel_path.startswith(_DATA_DIR_PREFIX):
+            if self._data_path is None:  # pragma: no cover - guarded in __init__
+                raise SupabasePersistenceError(
+                    f"cannot resolve mirror path '{rel_path}': no data directory"
+                )
+            return self._data_path / rel_path[len(_DATA_DIR_PREFIX) :]
         return self._workspace_path / rel_path
 
     async def restore(self) -> list[str]:

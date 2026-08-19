@@ -315,10 +315,15 @@ def _build_state_mirror(config: Any) -> Any | None:
         table=mirror_cfg.table,
         timeout_s=mirror_cfg.timeout_s,
     )
+    from nanobot.config.paths import get_data_dir
+
     return WorkspaceStateMirror(
         store=store,
         workspace_path=config.workspace_path,
         paths=mirror_cfg.paths,
+        # Credential-bearing state (MCP OAuth tokens) lives outside the
+        # workspace, so the mirror needs both roots to cover a cold container.
+        data_path=get_data_dir(),
     )
 
 

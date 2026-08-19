@@ -538,8 +538,12 @@ class SupabasePersistenceConfig(Base):
     service_key: str | None = None  # Secret/service key; inject via environment only
     table: str = "nanobot_state_blobs"  # Table in the public schema
     paths: list[str] = Field(
-        default_factory=lambda: ["cron/jobs.json"]
-    )  # Workspace-relative JSON files to mirror
+        default_factory=lambda: ["cron/jobs.json", "data:auth/mcp.json"]
+    )  # JSON files to mirror; a 'data:' prefix resolves against the data dir
+    # 'data:auth/mcp.json' carries the MCP OAuth tokens. Without it a redeploy
+    # wipes the credential store, so every browser-authorised MCP server (Make)
+    # comes back unauthenticated and its tools stay missing until a human
+    # clicks Connect again.
     restore_on_start: bool = True  # Pull remote state before the cron service starts
     snapshot_interval_s: int = Field(default=120, ge=15)  # Background snapshot cadence
     timeout_s: float = Field(default=15.0, gt=0)

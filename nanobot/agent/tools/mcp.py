@@ -58,6 +58,19 @@ _ReconnectCallback = Callable[[str, str, Tool], Awaitable[Tool | None]]
 MCPServerLoader = Callable[[], Mapping[str, "MCPServerConfig"]]
 MCPRuntimeStatus = Literal["connecting", "connected", "failed"]
 
+# Remote MCP servers close idle sessions, and a free container host can pause a
+# process long enough for that to happen mid-task. Both knobs exist so a slow or
+# rate-limited server can be tuned per deployment without a code change.
+_MCP_PING_INTERVAL_S = max(0.0, float(os.getenv("NANOBOT_MCP_PING_INTERVAL_S", "45")))
+_MCP_PING_TIMEOUT_S = max(1.0, float(os.getenv("NANOBOT_MCP_PING_TIMEOUT_S", "10")))
+_MCP_RECOVERY_MIN_DELAY_S = max(
+    1.0, float(os.getenv("NANOBOT_MCP_RECOVERY_MIN_DELAY_S", "5"))
+)
+_MCP_RECOVERY_MAX_DELAY_S = max(
+    _MCP_RECOVERY_MIN_DELAY_S,
+    float(os.getenv("NANOBOT_MCP_RECOVERY_MAX_DELAY_S", "300")),
+)
+
 
 class MCPConnection(Protocol):
     async def aclose(self) -> None: ...
