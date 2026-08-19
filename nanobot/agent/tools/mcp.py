@@ -70,6 +70,13 @@ _MCP_RECOVERY_MAX_DELAY_S = max(
     _MCP_RECOVERY_MIN_DELAY_S,
     float(os.getenv("NANOBOT_MCP_RECOVERY_MAX_DELAY_S", "300")),
 )
+# Bounded on purpose: an OAuth server whose refresh token was revoked will never
+# recover on its own, and an unbounded loop would hammer it forever. After this
+# many attempts the tools stay registered but the server is marked failed, so the
+# next real tool call (or a config reload) triggers a fresh attempt.
+_MCP_RECOVERY_MAX_ATTEMPTS = max(
+    1, int(os.getenv("NANOBOT_MCP_RECOVERY_MAX_ATTEMPTS", "8"))
+)
 
 
 class MCPConnection(Protocol):
