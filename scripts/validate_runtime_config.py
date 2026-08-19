@@ -17,6 +17,8 @@ os.environ.setdefault("COMPOSIO_USER_ID", "nanobot-owner")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "111:AAA-token")
 os.environ.setdefault("TELEGRAM_OWNER_ID", "8888207809")
 os.environ.setdefault("NANOBOT_WEB_TOKEN", "web-secret")
+os.environ.setdefault("SUPABASE_URL", "https://validate.supabase.co")
+os.environ.setdefault("SUPABASE_SERVICE_KEY", "sb_secret_validate")
 
 from nanobot.config.loader import load_config, resolve_config_env_vars  # noqa: E402
 from nanobot.providers.factory import _resolve_fallback_presets  # noqa: E402
@@ -95,6 +97,54 @@ class _AuthProbe(BaseChannel):
 probe = _AuthProbe(tg)
 check("owner is allowed", probe.is_allowed("8888207809"), True)
 check("stranger is denied", probe.is_allowed("123456789"), False)
+
+print("\n--- cron declarations (version-controlled bootstrap) ---")
+from nanobot.cron.bootstrap import bootstrap_declared_cron_jobs  # noqa: E402
+from nanobot.cron.service import CronService  # noqa: E402
+from nanobot.cron.session_turns import is_bound_cron_job  # noqa: E402
+
+check("cron bootstrap enabled", config.cron.enabled, True)
+declared = {d.id: d for d in config.cron.declarations}
+check("declaration ids", sorted(declared), ["composio-connection-health", "daily-brief"])
+check("daily-brief schedule", declared["daily-brief"].describe_schedule(), "cron 0 8 * * *")
+check("daily-brief timezone", declared["daily-brief"].build_schedule().tz, "Africa/Porto-Novo")
+check("daily-brief target expanded", declared["daily-brief"].to, "8888207809")
+check("daily-brief session key", declared["daily-brief"].session_key, "telegram:8888207809")
+
+with tempfile.TemporaryDirectory() as tmp:
+    store_path = Path(tmp) / "cron" / "jobs.json"
+    cron_service = CronService(store_path)
+    bootstrap = bootstrap_declared_cron_jobs(cron_service, config)
+    jobs = cron_service.list_jobs(include_disabled=True)
+    check("bootstrap failures", bootstrap.failed, {})
+    check(
+        "declared jobs registered",
+        sorted(job.id for job in jobs),
+        ["declared:composio-connection-health", "declared:daily-brief"],
+    )
+    check("declared jobs enabled", all(job.enabled for job in jobs), True)
+    check("declared jobs session-bound", all(is_bound_cron_job(job) for job in jobs), True)
+    check("declared jobs scheduled", all(job.state.next_run_at_ms for job in jobs), True)
+
+    # Simulate the ephemeral host: the whole cron store disappears on redeploy.
+    store_path.unlink()
+    rebuilt = CronService(store_path)
+    bootstrap_declared_cron_jobs(rebuilt, config)
+    check("declarations survive store loss", len(rebuilt.list_jobs()), 2)
+
+    # Re-applying the same config must not duplicate or disable anything.
+    again = bootstrap_declared_cron_jobs(rebuilt, config)
+    check("re-apply is idempotent", len(rebuilt.list_jobs()), 2)
+    check("re-apply prunes nothing", again.pruned, [])
+
+print("\n--- supabase state mirror ---")
+supabase = config.persistence.supabase
+check("mirror enabled", supabase.enabled, True)
+check("mirror url expanded", supabase.url, "https://validate.supabase.co")
+check("mirror key expanded", supabase.service_key, "sb_secret_validate")
+check("mirror table", supabase.table, "nanobot_state_blobs")
+check("mirror paths", supabase.paths, ["cron/jobs.json"])
+check("mirror restores on start", supabase.restore_on_start, True)
 
 print()
 if failures:

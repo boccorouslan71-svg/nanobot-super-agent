@@ -69,5 +69,42 @@
       "apiKey": "${COMPOSIO_API_KEY}",
       "userId": "${COMPOSIO_USER_ID}"
     }
+  },
+  "cron": {
+    "enabled": true,
+    "pruneRemoved": true,
+    "declarations": [
+      {
+        "id": "daily-brief",
+        "name": "Brief quotidien",
+        "cron": "0 8 * * *",
+        "timezone": "Africa/Porto-Novo",
+        "channel": "telegram",
+        "to": "${TELEGRAM_OWNER_ID}",
+        "message": "Prépare le brief du matin : consulte mes emails non lus et mon agenda du jour via les outils Composio connectés, puis envoie un résumé court en français — les messages qui attendent une réponse, les rendez-vous du jour, et ce qui est urgent. Si aucun compte n'est encore connecté, dis-le en une ligne au lieu d'inventer."
+      },
+      {
+        "id": "composio-connection-health",
+        "name": "Santé des connexions Composio",
+        "cron": "0 9 * * 1",
+        "timezone": "Africa/Porto-Novo",
+        "channel": "telegram",
+        "to": "${TELEGRAM_OWNER_ID}",
+        "message": "Vérifie l'état des comptes Composio connectés avec l'outil de diagnostic des connexions. Signale en français uniquement ce qui nécessite une action : comptes déconnectés, autorisations expirées, ou aucune connexion active. Si tout est sain, réponds en une seule phrase."
+      }
+    ]
+  },
+  "persistence": {
+    "supabase": {
+      "enabled": true,
+      "url": "${SUPABASE_URL}",
+      "serviceKey": "${SUPABASE_SERVICE_KEY}",
+      "table": "nanobot_state_blobs",
+      "paths": [
+        "cron/jobs.json"
+      ],
+      "restoreOnStart": true,
+      "snapshotIntervalS": 120
+    }
   }
 }

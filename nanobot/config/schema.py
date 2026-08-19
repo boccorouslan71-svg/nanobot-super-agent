@@ -434,6 +434,132 @@ class ToolsConfig(Base):
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
 
+_DECLARED_JOB_PREFIX = "declared:"
+_MINUTE_MS = 60_000
+
+
+class CronDeclarationConfig(Base):
+    """A version-controlled cron job declaration, re-applied on every startup.
+
+    Ephemeral hosts (e.g. Render free workers) lose the on-disk cron store on
+    redeploy or sleep. Declarations live in the config file, so the desired
+    schedules are re-created deterministically when the process starts.
+    """
+
+    _MINUTE_MS = 60_000
+
+    id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")  # Stable slug; the job id is derived from it
+    name: str | None = None  # Human-readable label (defaults to id)
+    enabled: bool = True  # Disabled declarations are pruned instead of registered
+    message: str = ""  # Agent turn prompt executed on each run
+    cron: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )  # Cron expression (mutually exclusive with everyMinutes)
+    every_minutes: int | None = Field(default=None, ge=1)  # Interval in minutes (mutually exclusive with cron)
+    timezone: str | None = None  # Overrides the agent default timezone
+    channel: str | None = None  # Optional delivery channel (e.g. "telegram")
+    to: str | None = None  # Optional delivery target (e.g. Telegram chat id)
+
+    @model_validator(mode="after")
+    def _validate_declaration(self) -> "CronDeclarationConfig":
+        """Reject ambiguous or unusable declarations at config load time."""
+        if bool(self.cron) == bool(self.every_minutes):
+            raise ValueError(
+                f"cron declaration '{self.id}' requires exactly one of 'cron' or 'everyMinutes'"
+            )
+        if self.enabled and not self.message.strip():
+            raise ValueError(f"enabled cron declaration '{self.id}' requires a non-empty 'message'")
+        if self.enabled and not (self.channel and self.to):
+            # The cron service only runs session-bound agent jobs; a declaration
+            # without a delivery target would be registered and then disabled.
+            raise ValueError(
+                f"enabled cron declaration '{self.id}' requires both 'channel' and 'to' "
+                "(e.g. channel: telegram, to: <chat id>)"
+            )
+        return self
+
+    @property
+    def session_key(self) -> str:
+        """Return the session key the declared job is bound to."""
+        return f"{self.channel}:{self.to}"
+
+    @property
+    def job_id(self) -> str:
+        """Return the deterministic cron job id owned by this declaration."""
+        return f"{_DECLARED_JOB_PREFIX}{self.id}"
+
+    @classmethod
+    def is_declared_job_id(cls, job_id: str) -> bool:
+        """Return True when a cron job id belongs to the declaration namespace."""
+        return job_id.startswith(_DECLARED_JOB_PREFIX)
+
+    def build_schedule(self, timezone: str | None = None) -> CronSchedule:
+        """Build the runtime schedule for this declaration."""
+        tz = self.timezone or timezone
+        if self.cron:
+            return CronSchedule(kind="cron", expr=self.cron, tz=tz)
+        return CronSchedule(
+            kind="every",
+            every_ms=cast(int, self.every_minutes) * _MINUTE_MS,
+            tz=tz,
+        )
+
+    def describe_schedule(self) -> str:
+        """Return a human-readable summary for startup output."""
+        if self.cron:
+            return f"cron {self.cron}"
+        return f"every {self.every_minutes}m"
+
+
+class CronBootstrapConfig(Base):
+    """Startup re-declaration of cron jobs from version-controlled config."""
+
+    enabled: bool = True  # Apply declarations on gateway startup
+    prune_removed: bool = True  # Remove previously declared jobs that left the config
+    declarations: list[CronDeclarationConfig] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_unique_ids(self) -> "CronBootstrapConfig":
+        """Reject duplicate declaration ids, which would silently overwrite each other."""
+        seen: set[str] = set()
+        for declaration in self.declarations:
+            if declaration.id in seen:
+                raise ValueError(f"duplicate cron declaration id '{declaration.id}'")
+            seen.add(declaration.id)
+        return self
+
+
+class SupabasePersistenceConfig(Base):
+    """Mirror ephemeral runtime state into Supabase (PostgREST) so it survives restarts."""
+
+    enabled: bool = False
+    url: str | None = None  # e.g. https://<ref>.supabase.co
+    service_key: str | None = None  # Secret/service key; inject via environment only
+    table: str = "nanobot_state_blobs"  # Table in the public schema
+    paths: list[str] = Field(
+        default_factory=lambda: ["cron/jobs.json"]
+    )  # Workspace-relative JSON files to mirror
+    restore_on_start: bool = True  # Pull remote state before the cron service starts
+    snapshot_interval_s: int = Field(default=120, ge=15)  # Background snapshot cadence
+    timeout_s: float = Field(default=15.0, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_credentials(self) -> "SupabasePersistenceConfig":
+        """An enabled mirror without credentials is a silent data-loss trap."""
+        if self.enabled and not (self.url and self.service_key):
+            raise ValueError(
+                "persistence.supabase is enabled but 'url' and 'serviceKey' are not both set"
+            )
+        return self
+
+
+class PersistenceConfig(Base):
+    """Durable state mirrors for hosts without a persistent disk."""
+
+    supabase: SupabasePersistenceConfig = Field(default_factory=SupabasePersistenceConfig)
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
@@ -446,6 +572,8 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    cron: CronBootstrapConfig = Field(default_factory=CronBootstrapConfig)
+    persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)
     model_presets: dict[str, ModelPresetConfig] = Field(
         default_factory=dict,
         validation_alias=AliasChoices("modelPresets", "model_presets"),

@@ -286,6 +286,42 @@ async def _close_gateway_runtime(
             await runtime_tasks
 
 
+def _is_unresolved_placeholder(value: str | None) -> bool:
+    """True when a config value still carries an unresolved ${VAR} placeholder."""
+    return bool(value) and str(value).strip().startswith("${")
+
+
+def _build_state_mirror(config: Any) -> Any | None:
+    """Build the Supabase state mirror when persistence is configured.
+
+    Returns None when the mirror is disabled or its credentials were never
+    injected, so an unset environment degrades to "no mirror" instead of a
+    startup crash or a noisy retry loop.
+    """
+    mirror_cfg = config.persistence.supabase
+    if not mirror_cfg.enabled:
+        return None
+    if _is_unresolved_placeholder(mirror_cfg.url) or _is_unresolved_placeholder(
+        mirror_cfg.service_key
+    ):
+        logger.info("Supabase state mirror: credentials not set; running without it")
+        return None
+
+    from nanobot.persistence import SupabaseStateStore, WorkspaceStateMirror
+
+    store = SupabaseStateStore(
+        url=mirror_cfg.url or "",
+        service_key=mirror_cfg.service_key or "",
+        table=mirror_cfg.table,
+        timeout_s=mirror_cfg.timeout_s,
+    )
+    return WorkspaceStateMirror(
+        store=store,
+        workspace_path=config.workspace_path,
+        paths=mirror_cfg.paths,
+    )
+
+
 def _run_gateway(
     config: Config,
     *,
@@ -407,6 +443,25 @@ def _run_gateway(
     # Preserve existing single-workspace installs, but keep custom workspaces clean.
     if is_default_workspace(config.workspace_path):
         _migrate_cron_store(config)
+
+    # Restore mirrored runtime state before anything reads the cron store.
+    # On hosts without a persistent disk the workspace is empty on boot; the
+    # mirror repopulates it so scheduled jobs and sessions survive a redeploy.
+    state_mirror = _build_state_mirror(config)
+    if state_mirror is not None and config.persistence.supabase.restore_on_start:
+        from nanobot.persistence import SupabasePersistenceError
+
+        try:
+            restored_paths = asyncio.run(state_mirror.restore())
+        except SupabasePersistenceError as exc:
+            console.print(f"[yellow]○[/yellow] Supabase state restore skipped: {exc}[/yellow]")
+        else:
+            if restored_paths:
+                console.print(
+                    f"[green]✓[/green] Supabase state restored: {', '.join(restored_paths)}"
+                )
+            else:
+                console.print("[green]✓[/green] Supabase state mirror: local state is current")
 
     # Create cron service with workspace-scoped store
     cron_store_path = config.workspace_path / "cron" / "jobs.json"
@@ -803,6 +858,21 @@ def _run_gateway(
             payload=CronPayload(kind="system_event"),
         ))
 
+    # Re-declare version-controlled cron jobs (idempotent; survives disk loss)
+    from nanobot.cron.bootstrap import bootstrap_declared_cron_jobs
+
+    cron_bootstrap = bootstrap_declared_cron_jobs(cron, config)
+    if not cron_bootstrap.enabled:
+        console.print("[yellow]○[/yellow] Cron declarations: disabled")
+    elif cron_bootstrap.registered or cron_bootstrap.pruned or cron_bootstrap.failed:
+        style = "red" if cron_bootstrap.failed else "green"
+        marker = "✗" if cron_bootstrap.failed else "✓"
+        console.print(
+            f"[{style}]{marker}[/{style}] Cron declarations: {cron_bootstrap.describe()}"
+        )
+        for declaration_id, error in cron_bootstrap.failed.items():
+            console.print(f"  [red]•[/red] {declaration_id}: {error}")
+
     async def _open_browser_when_ready() -> None:
         """Wait for the gateway to bind, then point the user's browser at the webui."""
         if not open_browser_url:
@@ -898,6 +968,11 @@ def _run_gateway(
                     name="nanobot-gateway-client-monitor",
                 ),
             ]
+            if state_mirror is not None:
+                tasks.append(asyncio.create_task(
+                    state_mirror.run_forever(config.persistence.supabase.snapshot_interval_s),
+                    name="nanobot-supabase-mirror",
+                ))
             if health_server_enabled:
                 tasks.append(asyncio.create_task(
                     _health_server(config.gateway.host, port),
