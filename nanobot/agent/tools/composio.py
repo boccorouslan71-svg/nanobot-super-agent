@@ -420,10 +420,9 @@ class ComposioExecuteTool(_ComposioTool):
 
         page_token = None
         root = pages_payload.get("data")
-        if isinstance(root, dict):
-            pages = root.get("data", [])
-        else:
-            pages = []
+        if isinstance(root, dict) and isinstance(root.get("response_data"), dict):
+            root = root.get("response_data", {})
+        pages = root.get("data", []) if isinstance(root, dict) else []
         for page in pages if isinstance(pages, list) else []:
             if str(page.get("id")) == page_id:
                 page_token = page.get("access_token")

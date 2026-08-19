@@ -308,10 +308,12 @@ async def test_execute_honours_per_call_user_id() -> None:
 _PAGES_PAYLOAD = {
     "successful": True,
     "data": {
-        "data": [
-            {"id": "1192699313930831", "name": "Maya Gold", "access_token": "page-token-abc"},
-            {"id": "1129160526949038", "name": "Kalza Officiel", "access_token": "page-token-xyz"},
-        ]
+        "response_data": {
+            "data": [
+                {"id": "1192699313930831", "name": "Maya Gold", "access_token": "page-token-abc"},
+                {"id": "1129160526949038", "name": "Kalza Officiel", "access_token": "page-token-xyz"},
+            ]
+        }
     },
 }
 
