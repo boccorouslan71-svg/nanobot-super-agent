@@ -746,6 +746,21 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         backend="openai_compat",
         default_api_base="https://qianfan.baidubce.com/v2"
     ),
+    # === Agnes AI ==========================================================
+    # OpenAI-compatible API hub at apihub.agnes-ai.com. Its keys use the
+    # generic "sk-" prefix, so detection deliberately relies on the model
+    # keyword and api_base instead of detect_by_key_prefix, which would
+    # collide with plain OpenAI keys.
+    ProviderSpec(
+        name="agnes",
+        keywords=("agnes", "agnes-ai", "agnes_ai"),
+        env_key="AGNES_API_KEY",
+        display_name="Agnes AI",
+        backend="openai_compat",
+        detect_by_base_keyword="agnes-ai.com",
+        default_api_base="https://apihub.agnes-ai.com/v1",
+        strip_model_prefixes=("agnes", "agnes-ai", "agnes_ai"),
+    ),
 )
 
 
