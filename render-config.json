@@ -101,7 +101,8 @@
       "serviceKey": "${SUPABASE_SERVICE_KEY}",
       "table": "nanobot_state_blobs",
       "paths": [
-        "cron/jobs.json"
+        "cron/jobs.json",
+        "data:auth/mcp.json"
       ],
       "restoreOnStart": true,
       "snapshotIntervalS": 120

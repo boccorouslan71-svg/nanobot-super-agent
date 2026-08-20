@@ -143,7 +143,7 @@ check("mirror enabled", supabase.enabled, True)
 check("mirror url expanded", supabase.url, "https://validate.supabase.co")
 check("mirror key expanded", supabase.service_key, "sb_secret_validate")
 check("mirror table", supabase.table, "nanobot_state_blobs")
-check("mirror paths", supabase.paths, ["cron/jobs.json"])
+check("mirror paths", supabase.paths, ["cron/jobs.json", "data:auth/mcp.json"])
 check("mirror restores on start", supabase.restore_on_start, True)
 
 print("\n--- free-tier keepalive (anti-sleep self ping) ---")
