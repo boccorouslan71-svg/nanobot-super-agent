@@ -26,6 +26,11 @@ import httpx
 
 _DEFAULT_SERVICE_URL = "https://nanobot-abee.onrender.com"
 _TIMEOUT = httpx.Timeout(60.0, connect=30.0)
+# The Agnès endpoint queues requests under load and has been observed answering
+# the same probe in 9s and in over 60s. A read timeout there says nothing about
+# provider health, so the primary probe gets its own budget and one retry —
+# otherwise the deployment judge reports a false outage.
+_PRIMARY_TIMEOUT = httpx.Timeout(180.0, connect=30.0)
 
 _GREEN, _RED, _DIM, _RESET = "\033[32m", "\033[31m", "\033[2m", "\033[0m"
 
@@ -227,28 +232,37 @@ def check_providers(report: Report) -> None:
         key = _env("AGNES_API_KEY")
         if not key:
             return False, "AGNES_API_KEY missing"
-        with httpx.Client(timeout=_TIMEOUT) as client:
-            response = client.post(
-                "https://apihub.agnes-ai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {key}"},
-                json={
-                    "model": "agnes-2.5-flash",
-                    "messages": [{"role": "user", "content": "Reply with the single word: ok"}],
-                    # Generous on purpose: this is a reasoning model, and a small
-                    # budget is spent entirely on reasoning_content, leaving the
-                    # visible answer empty for reasons that have nothing to do
-                    # with provider health.
-                    "max_tokens": 256,
-                },
-            )
-        if response.status_code != 200:
-            return False, f"HTTP {response.status_code}"
-        choices = (response.json() or {}).get("choices") or []
-        message = (choices[0].get("message") or {}) if choices else {}
-        answer = (message.get("content") or "").strip()
-        reasoning = (message.get("reasoning_content") or "").strip()
-        # Either channel proves the model generated tokens.
-        return bool(answer or reasoning), f"answered {(answer or reasoning)[:24]!r}"
+        payload = {
+            "model": "agnes-2.5-flash",
+            "messages": [{"role": "user", "content": "Reply with the single word: ok"}],
+            # Generous on purpose: this is a reasoning model, and a small
+            # budget is spent entirely on reasoning_content, leaving the
+            # visible answer empty for reasons that have nothing to do
+            # with provider health.
+            "max_tokens": 256,
+        }
+        last_error = ""
+        # Two attempts: a read timeout here is queue latency, not an outage.
+        for _ in range(2):
+            try:
+                with httpx.Client(timeout=_PRIMARY_TIMEOUT) as client:
+                    response = client.post(
+                        "https://apihub.agnes-ai.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {key}"},
+                        json=payload,
+                    )
+            except httpx.TimeoutException as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                continue
+            if response.status_code != 200:
+                return False, f"HTTP {response.status_code}"
+            choices = (response.json() or {}).get("choices") or []
+            message = (choices[0].get("message") or {}) if choices else {}
+            answer = (message.get("content") or "").strip()
+            reasoning = (message.get("reasoning_content") or "").strip()
+            # Either channel proves the model generated tokens.
+            return bool(answer or reasoning), f"answered {(answer or reasoning)[:24]!r}"
+        return False, last_error or "no response"
 
     report.guard("primary model responds (agnes-2.5-flash)", _agnes)
 
