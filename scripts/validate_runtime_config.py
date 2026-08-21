@@ -231,6 +231,41 @@ check(
 check("workspace work survives a cold start", restored_contents["workspace/notes.md"], "agent work")
 check("excluded logs are not restored", logs_leaked, False)
 
+print("\n--- seeded image skills (unrepeatable-loss guard) ---")
+from nanobot.persistence import seed_skills  # noqa: E402
+
+shipped = repo / "seed-skills"
+check("seed tree is committed", shipped.is_dir(), True)
+names = sorted(p.name for p in shipped.iterdir() if p.is_dir()) if shipped.is_dir() else []
+check("skills shipped in the image", names, ["agnes-image", "cloudflare-ai-image", "hugging-face-image"])
+for name in names:
+    check(f"{name} has SKILL.md", (shipped / name / "SKILL.md").is_file(), True)
+    check(f"{name} has a runnable script", (shipped / name / "scripts" / "gen_image.py").is_file(), True)
+
+with tempfile.TemporaryDirectory() as seed_dir:
+    root = Path(seed_dir) / "workspace" / "skills"
+    seeded, skipped = seed_skills.seed(shipped, root)
+    check("a fresh container gets every skill", sorted(seeded), names)
+    again = seed_skills.seed(shipped, root)
+    check("a second boot overwrites nothing", again, ([], names))
+
+# Keys must live in the environment, never in the shipped copy.
+leaks = [
+    f"{p.name}:{m}"
+    for p in shipped.rglob("*")
+    if p.is_file()
+    for m in ("cfut_", "hf_PhG", "sk-Lme", "sk-or-v1-")
+    if m in p.read_text(errors="replace")
+]
+check("no credentials committed in the seeded skills", leaks, [])
+
+entrypoint_text = (repo / "entrypoint.sh").read_text()
+seed_at = entrypoint_text.find("nanobot.persistence.seed_skills")
+restore_at2 = entrypoint_text.find("nanobot.persistence.bootstrap")
+check("skills are seeded after the durable restore", -1 < restore_at2 < seed_at, True)
+check("seeding failure is non-fatal", "continuing without it" in entrypoint_text, True)
+check("Dockerfile ships the seed tree", "COPY seed-skills/" in (repo / "Dockerfile").read_text(), True)
+
 # Ordering in entrypoint.sh is load-bearing: a restore that runs after the
 # config template is written can never bring back edited provider settings.
 entrypoint = (repo / "entrypoint.sh").read_text()

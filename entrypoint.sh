@@ -25,6 +25,12 @@ if [ "$RENDER" = "true" ]; then
         echo "[entrypoint] error: durable state restore failed — refusing to start" >&2
         exit 1
     fi
+    # Reinstall any missing image-generation skill from the image. Runs after the
+    # restore so a mirrored (possibly agent-edited) copy always wins, and never
+    # overwrites what is already on disk. A failure here is not fatal: the agent
+    # is still usable without these skills.
+    python -m nanobot.persistence.seed_skills || \
+        echo "[entrypoint] warning: skill seeding failed — continuing without it"
     # Initialize config only when it does not already exist, so WebUI/provider
     # settings edited at runtime survive restarts — they come back through the
     # restore above, which is what makes this branch a genuine first-boot path.
