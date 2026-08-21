@@ -38,6 +38,14 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+# How late a missed run may still be executed after the service comes back.
+# This host recycles its container (and the free instance sleeps), so a run that
+# fell due while the process was down is normal, not exceptional. Replaying it
+# within a day is what the user expects from "scheduled"; replaying a run that
+# was due last week is noise, so past the window the miss is recorded instead.
+_MISSED_RUN_GRACE_MS = 24 * 60 * 60 * 1000
+
+
 def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
     """Compute next run time in ms."""
     if schedule.kind == "at":
@@ -65,6 +73,11 @@ def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
             return None
 
     return None
+
+
+def _format_ms(ms: int) -> str:
+    """Render an epoch-ms instant in local time for operator-facing messages."""
+    return datetime.fromtimestamp(ms / 1000).astimezone().isoformat(timespec="seconds")
 
 
 def _validate_schedule_for_add(schedule: CronSchedule) -> None:
@@ -160,8 +173,10 @@ class CronService:
         store_path: Path,
         on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None,
         max_sleep_ms: int = 300_000,  # 5 minutes
+        missed_run_grace_ms: int = _MISSED_RUN_GRACE_MS,
     ):
         self.store_path = store_path
+        self.missed_run_grace_ms = missed_run_grace_ms
         self._action_path = store_path.parent / "action.jsonl"
         self._run_records_dir = store_path.parent / "runs"
         self._lock = FileLock(str(self._action_path.parent) + ".lock")
@@ -466,7 +481,9 @@ class CronService:
                 "refusing to start with an empty job list. "
                 "Inspect the .corrupt-<ts> backup and restore manually."
             )
-        self._recompute_next_runs()
+        # Restart-safe: a run that fell due while the process was down keeps its
+        # overdue timestamp so the normal due-job pass executes it once.
+        self._recompute_next_runs(preserve_overdue=True)
         self._save_store()
         self._arm_timer()
         logger.info("Cron service started with {} jobs", len(self._store.jobs if self._store else []))
@@ -478,16 +495,75 @@ class CronService:
             self._timer_task.cancel()
             self._timer_task = None
 
-    def _recompute_next_runs(self) -> None:
-        """Recompute next run times for all enabled jobs."""
+    def _recompute_next_runs(self, *, preserve_overdue: bool = False) -> None:
+        """Recompute next run times for all enabled jobs.
+
+        With *preserve_overdue* (used at startup), a run that was already due
+        before this call is not recomputed away. Recomputing unconditionally is
+        what silently drops work across a restart: the daily brief that fell due
+        while the container was recycled would jump to tomorrow, and a one-off
+        reminder whose moment had passed would get ``None`` and never fire
+        again, while still sitting in the job list looking scheduled.
+        """
         if not self._store:
             return
         now = _now_ms()
         for job in self._store.jobs:
             if self._enforce_agent_binding(job):
                 continue
-            if job.enabled:
-                job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
+            if not job.enabled:
+                continue
+            due_at = job.state.next_run_at_ms
+            if preserve_overdue and due_at is not None and due_at <= now:
+                if self._claim_missed_run(job, due_at, now):
+                    continue
+            job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
+
+    def _claim_missed_run(self, job: CronJob, due_at: int, now: int) -> bool:
+        """Decide what to do with a run that fell due while we were down.
+
+        Returns ``True`` when the overdue timestamp is kept so the scheduler
+        executes it, ``False`` when the caller should reschedule normally.
+        """
+        # Heartbeats and other internal periodic events carry no information
+        # worth replaying: the next tick does the same work as the missed one.
+        if job.payload.kind != "agent_turn":
+            return False
+
+        lateness_ms = now - due_at
+        if lateness_ms <= self.missed_run_grace_ms:
+            logger.info(
+                "Cron: job '{}' ({}) was due {}s ago while the service was down; "
+                "running it now",
+                job.name,
+                job.id,
+                lateness_ms // 1000,
+            )
+            return True
+
+        # Too stale to run. Record the miss on the job so it is visible in
+        # ``list_jobs`` and the run history rather than vanishing silently.
+        reason = (
+            f"missed scheduled run at {_format_ms(due_at)} "
+            f"({lateness_ms // 3_600_000}h late); the service was not running "
+            "and the run is past its catch-up window"
+        )
+        job.state.last_status = "skipped"
+        job.state.last_error = reason
+        job.state.run_history.append(
+            CronRunRecord(run_at_ms=due_at, status="skipped", duration_ms=0, error=reason)
+        )
+        job.state.run_history = job.state.run_history[-self._MAX_RUN_HISTORY:]
+        job.updated_at_ms = now
+        logger.warning("Cron: job '{}' ({}) {}", job.name, job.id, reason)
+
+        if job.schedule.kind == "at":
+            # A one-shot whose moment has passed can never come due again.
+            # Disable it explicitly so its state says so.
+            job.enabled = False
+            job.state.next_run_at_ms = None
+            return True
+        return False
 
     def _get_next_wake_ms(self) -> int | None:
         """Get the earliest next run time across all jobs."""
@@ -705,11 +781,36 @@ class CronService:
         return job
 
     def register_system_job(self, job: CronJob) -> CronJob:
-        """Register an internal system job (idempotent on restart)."""
+        """Register an internal or declared job (idempotent on restart).
+
+        The declaration owns the *definition* (schedule, message, enabled), the
+        store owns the *history* (last run, run records, a pending overdue run).
+        Replacing the stored state wholesale on every boot is what made
+        scheduled work look amnesiac across a restart: run history reset to
+        empty, and a run that fell due while the container was down erased
+        before ``start`` could catch up on it. So carry the state over, and only
+        recompute the next run when there is nothing to carry or when the
+        schedule itself changed.
+        """
         store = self._require_store()
         now = _now_ms()
-        job.state = CronJobState(next_run_at_ms=_compute_next_run(job.schedule, now))
-        job.created_at_ms = now
+        previous = next((j for j in store.jobs if j.id == job.id), None)
+
+        if previous is None:
+            job.state = CronJobState(next_run_at_ms=_compute_next_run(job.schedule, now))
+            job.created_at_ms = now
+        else:
+            job.state = previous.state
+            job.created_at_ms = previous.created_at_ms
+            schedule_changed = previous.schedule != job.schedule
+            if schedule_changed or job.state.next_run_at_ms is None:
+                job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
+                if schedule_changed:
+                    logger.info(
+                        "Cron: job '{}' ({}) schedule changed; rescheduled from now",
+                        job.name,
+                        job.id,
+                    )
         job.updated_at_ms = now
         store.jobs = [j for j in store.jobs if j.id != job.id]
         store.jobs.append(job)
