@@ -557,6 +557,14 @@ def _run_gateway(
     )
 
     tools = ToolRegistry()
+    # Installed CLI apps live in their own environment, whose bin dir is not on
+    # this process's PATH. Publish it before MCP starts: an MCP stdio server
+    # shipped by an app is spawned by command name, and an unresolvable command
+    # there used to cost a full connection timeout at every boot.
+    with suppress(Exception):
+        from nanobot.apps.cli.service import CliAppManager
+
+        CliAppManager(workspace=config.workspace_path).expose_env_on_path()
     mcp_provider = MCPProvider.from_config(config, tools)
 
     # Create agent with cron service
@@ -1013,6 +1021,13 @@ def _run_gateway(
             # Re-read once on first admission to close the watcher subscription window.
             agent.runtime_resolver.invalidate()
             async def _run_agent() -> None:
+                # Connect on this task rather than a child of it: an MCP session's
+                # exit stack must be closed from the task that entered it, and the
+                # close below runs here. The startup cost is bounded inside the
+                # connect itself -- per-server and batch ceilings, servers
+                # connected concurrently, and an unresolvable stdio launcher
+                # failing fast -- so this no longer serializes one timeout per
+                # server the way it used to.
                 try:
                     await mcp_provider.connect()
                     await agent.run()

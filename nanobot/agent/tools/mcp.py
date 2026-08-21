@@ -77,6 +77,33 @@ _MCP_RECOVERY_MAX_DELAY_S = max(
 _MCP_RECOVERY_MAX_ATTEMPTS = max(
     1, int(os.getenv("NANOBOT_MCP_RECOVERY_MAX_ATTEMPTS", "8"))
 )
+# A server that never answers must not hold the whole batch. Servers are
+# connected concurrently, so the per-server ceiling is also very nearly the
+# batch ceiling; the batch budget only guards against many servers each
+# stalling in their own way.
+_MCP_CONNECT_TIMEOUT_S = max(
+    1.0, float(os.getenv("NANOBOT_MCP_CONNECT_TIMEOUT_S", "20"))
+)
+_MCP_CONNECT_BATCH_TIMEOUT_S = max(
+    _MCP_CONNECT_TIMEOUT_S,
+    float(os.getenv("NANOBOT_MCP_CONNECT_BATCH_TIMEOUT_S", "45")),
+)
+
+
+def _stdio_command_available(command: str) -> bool:
+    """Return whether a stdio server's launcher can actually be started.
+
+    An absent binary is the common shape of a stale server entry: an app was
+    uninstalled, or its install never landed in this container. Without this
+    check the SDK spawn failure surfaces only after the connect timeout, and
+    that wait used to be paid once per server before the agent became ready.
+    """
+    if not command:
+        return False
+    separators = [sep for sep in (os.sep, os.altsep) if sep]
+    if any(sep in command for sep in separators):
+        return os.path.isfile(command) or shutil.which(command) is not None
+    return shutil.which(command) is not None
 
 
 class MCPConnection(Protocol):
@@ -1085,6 +1112,22 @@ async def connect_mcp_servers(
                     return False
 
             if transport_type == "stdio":
+                if not _stdio_command_available(cfg.command):
+                    # An unresolvable launcher is a strong hint of a stale server
+                    # entry, but it is only a hint, so it warns instead of
+                    # deciding: the PATH visible here is not necessarily the PATH
+                    # the spawn resolves against (a CLI app publishes its bin
+                    # directory later in startup), and a wrapped transport may
+                    # never spawn the binary at all. What bounds the cost of a
+                    # genuinely missing binary is the per-server connect ceiling
+                    # plus concurrent connection, not this pre-check.
+                    logger.warning(
+                        "MCP server '{}': command '{}' not found on PATH, "
+                        "connecting anyway (install the app that provides it, "
+                        "or remove the server if this keeps failing)",
+                        name,
+                        cfg.command,
+                    )
                 command, args, env = _normalize_windows_stdio_command(
                     cfg.command,
                     cfg.args,
@@ -1315,22 +1358,79 @@ async def connect_mcp_servers(
         return name, connection
 
     server_stacks: dict[str, MCPConnection] = {}
-    attempted_names: list[str] = []
+    attempted_names: list[str] = list(mcp_servers)
+
+    async def connect_bounded(
+        name: str, cfg: MCPServerConfig
+    ) -> tuple[str, MCPConnection | None]:
+        """Connect one server under its own ceiling, never raising for peers.
+
+        Each server is attempted concurrently so one slow or unreachable peer
+        costs its own timeout rather than delaying every server behind it.
+        """
+        try:
+            return await asyncio.wait_for(
+                connect_single_server(name, cfg), timeout=_MCP_CONNECT_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "MCP server '{}': connection timed out after {}s, skipping",
+                name,
+                _MCP_CONNECT_TIMEOUT_S,
+            )
+            _unregister_server_tools(registry, name)
+            return name, None
+        except Exception as exc:
+            _log_mcp_connection_failure(name, exc)
+            return name, None
+
+    tasks: dict[asyncio.Task[tuple[str, MCPConnection | None]], str] = {
+        asyncio.create_task(connect_bounded(name, cfg), name=f"mcp-connect:{name}"): name
+        for name, cfg in mcp_servers.items()
+    }
+
+    def collect(task: asyncio.Task[tuple[str, MCPConnection | None]]) -> None:
+        """Adopt a finished task's connection, if it produced one.
+
+        Also called for tasks cancelled during rollback: one may have completed
+        between the wait returning and the cancel landing, and an unadopted
+        connection would leak its owning task.
+        """
+        if task.cancelled() or not task.done():
+            return
+        if task.exception() is not None:
+            return
+        name, connection = task.result()
+        if connection is not None:
+            server_stacks[name] = connection
 
     try:
-        for name, cfg in mcp_servers.items():
-            attempted_names.append(name)
-            try:
-                result = await connect_single_server(name, cfg)
-            except Exception as e:
-                _log_mcp_connection_failure(name, e)
-                continue
-            if result[1] is not None:
-                server_stacks[result[0]] = result[1]
+        done, pending = await asyncio.wait(tasks, timeout=_MCP_CONNECT_BATCH_TIMEOUT_S)
+        for task in done:
+            collect(task)
+        for task in pending:
+            logger.warning(
+                "MCP server '{}': dropped, batch connect budget of {}s exhausted",
+                tasks[task],
+                _MCP_CONNECT_BATCH_TIMEOUT_S,
+            )
+            task.cancel()
+            _unregister_server_tools(registry, tasks[task])
+        if pending:
+            with suppress(BaseException):
+                await asyncio.gather(*pending, return_exceptions=True)
+            for task in pending:
+                collect(task)
     except BaseException:
-        # Callers can bound readiness/reload with a timeout. If cancellation
-        # interrupts a later server, ownership of earlier connections has not
-        # transferred yet, so roll the whole batch back before propagating it.
+        # Callers can bound readiness/reload with a timeout. Ownership of any
+        # connection opened so far has not transferred to the caller yet, so
+        # gather what did open and roll the whole batch back before propagating.
+        for task in tasks:
+            task.cancel()
+        with suppress(BaseException):
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for task in tasks:
+                collect(task)
         for name in attempted_names:
             _unregister_server_tools(registry, name)
         try:
