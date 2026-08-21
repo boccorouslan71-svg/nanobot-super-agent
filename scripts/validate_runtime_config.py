@@ -145,6 +145,7 @@ check("mirror key expanded", supabase.service_key, "sb_secret_validate")
 check("mirror table", supabase.table, "nanobot_state_blobs")
 check("mirror paths", supabase.paths, ["cron/jobs.json", "data:auth/mcp.json"])
 check("mirror restores on start", supabase.restore_on_start, True)
+check("json mirror cadence", supabase.snapshot_interval_s, 15)
 
 print("\n--- free-tier keepalive (anti-sleep self ping) ---")
 from nanobot.persistence import build_keepalive  # noqa: E402
@@ -175,7 +176,7 @@ from nanobot.persistence import TreeArchiveMirror  # noqa: E402
 tree_cfg = config.persistence.supabase
 check("tree mirror enabled", tree_cfg.tree_enabled, True)
 check("tree row key", tree_cfg.tree_key, "state/data-tree")
-check("tree snapshot cadence", tree_cfg.tree_snapshot_interval_s, 300)
+check("tree snapshot cadence", tree_cfg.tree_snapshot_interval_s, 15)
 check("tree size limit", tree_cfg.tree_max_bytes, 40000000)
 # Write-heavy or regenerable paths stay out; everything else is user state.
 for skipped in ("logs", "media", "__pycache__", "node_modules"):
@@ -230,6 +231,42 @@ check(
 )
 check("workspace work survives a cold start", restored_contents["workspace/notes.md"], "agent work")
 check("excluded logs are not restored", logs_leaked, False)
+
+# A 15s cadence is only safe because an unchanged tree costs a stat walk instead
+# of a full archive build. Assert that here: if the fast path ever regresses, the
+# deployment would quietly read and gzip the whole data dir 240 times an hour.
+async def _idle_cycles_are_cheap() -> tuple[int, int, int]:
+    with tempfile.TemporaryDirectory() as work_dir:
+        root = Path(work_dir)
+        (root / "workspace").mkdir(parents=True)
+        (root / "config.json").write_text('{"providers": {}}')
+        (root / "workspace" / "notes.md").write_text("state")
+
+        builds = 0
+
+        class _CountingMirror(TreeArchiveMirror):
+            def build_archive(self):  # type: ignore[no-untyped-def]
+                nonlocal builds
+                builds += 1
+                return super().build_archive()
+
+        store = _MemoryStore()
+        mirror = _CountingMirror(
+            store=store, root=root, key=tree_cfg.tree_key, excludes=tree_cfg.tree_excludes
+        )
+        first = await mirror.snapshot()
+        for _ in range(20):  # five minutes of 15s ticks with nothing happening
+            await mirror.snapshot()
+        idle_builds = builds
+        (root / "workspace" / "new-skill.md").write_text("# created by the agent")
+        after_change = await mirror.snapshot()
+        return first, idle_builds, after_change
+
+
+first_push, idle_builds, change_push = asyncio.run(_idle_cycles_are_cheap())
+check("first cycle mirrors the tree", first_push > 0, True)
+check("20 idle cycles rebuild the archive once", idle_builds, 1)
+check("a new file is still mirrored on the next cycle", change_push > 0, True)
 
 print("\n--- seeded image skills (unrepeatable-loss guard) ---")
 from nanobot.persistence import seed_skills  # noqa: E402

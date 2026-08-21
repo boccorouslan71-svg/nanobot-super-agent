@@ -153,6 +153,7 @@ class TreeArchiveMirror:
         self._excludes = tuple(excludes if excludes is not None else DEFAULT_TREE_EXCLUDES)
         self._max_bytes = max_bytes
         self._hash: str | None = None
+        self._signature: str | None = None
 
     @property
     def key(self) -> str:
@@ -238,8 +239,43 @@ class TreeArchiveMirror:
 
     # --------------------------------------------------------------- transfer
 
+    def tree_signature(self) -> str:
+        """Return a cheap fingerprint of the tree: path, size and mtime only.
+
+        This exists so a short snapshot cadence stays affordable. Building the
+        archive means reading and gzipping every mirrored file; at a 15s cadence
+        that is 240 full reads an hour, almost all of them producing a payload
+        identical to the last one. Stat-ing the same files costs no reads, so an
+        idle cycle can be dismissed for the price of a directory walk.
+
+        Deliberately *not* a content hash: it must be strictly cheaper than the
+        work it guards. mtime is nanosecond-resolution, so a rewritten file
+        changes the signature even when its size is identical; and the signature
+        only ever suppresses work when nothing looks touched — the archive digest
+        remains the authority on whether a push is actually needed.
+        """
+        parts: list[str] = []
+        for path in self.iter_files():
+            rel = path.relative_to(self._root).as_posix()
+            try:
+                stat = path.stat()
+            except OSError:
+                # A file that vanished mid-walk is a change by definition; let
+                # the archive build be the one to deal with it.
+                return ""
+            parts.append(f"{rel}:{stat.st_size}:{stat.st_mtime_ns}")
+        if not parts:
+            return ""
+        return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
     async def snapshot(self, *, force: bool = False) -> int:
         """Push the tree when it changed; return the number of files pushed."""
+        signature = self.tree_signature()
+        # An empty signature means either an empty tree or a file that moved
+        # under us. Both must fall through: the empty-tree case has its own
+        # guard below, and a moving tree needs a real archive pass.
+        if not force and signature and signature == self._signature:
+            return 0
         archive, count = self.build_archive()
         if count == 0:
             # A fresh container that failed to restore must not erase the
@@ -253,6 +289,10 @@ class TreeArchiveMirror:
             return 0
         digest = hashlib.sha256(archive).hexdigest()
         if not force and self._hash == digest:
+            # Touched but not changed (a rewrite with identical content). The
+            # remote is already current, so record the new signature and skip
+            # the rebuild next cycle too.
+            self._signature = signature
             return 0
         payload = {
             "format": _ARCHIVE_FORMAT,
@@ -263,6 +303,9 @@ class TreeArchiveMirror:
         }
         await self._store.push(self._key, payload)
         self._hash = digest
+        # Only after a successful push: if the push raises, the next cycle must
+        # rebuild and retry rather than believe the tree is already mirrored.
+        self._signature = signature
         logger.info(
             "Supabase tree mirror: snapshotted {} files ({} bytes) from {}",
             count,

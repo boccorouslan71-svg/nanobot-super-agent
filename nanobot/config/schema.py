@@ -559,8 +559,11 @@ class SupabasePersistenceConfig(Base):
     tree_excludes: list[str] = Field(default_factory=lambda: list(_DEFAULT_TREE_EXCLUDES))
     tree_max_bytes: int = Field(default=40_000_000, gt=0)  # Refuse to push more than this
     # Archiving the whole tree costs more than serialising one JSON file, so it
-    # runs on its own, slower cadence. A crash loses at most this much work.
-    tree_snapshot_interval_s: int = Field(default=300, ge=30)
+    # keeps its own cadence knob. The floor is 15s rather than 30s because an
+    # unchanged tree no longer costs an archive build: TreeArchiveMirror
+    # stat-checks the tree first and dismisses an idle cycle without reading a
+    # single file. A crash loses at most this much work.
+    tree_snapshot_interval_s: int = Field(default=300, ge=15)
 
     @model_validator(mode="after")
     def _validate_credentials(self) -> "SupabasePersistenceConfig":

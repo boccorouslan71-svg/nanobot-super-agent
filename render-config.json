@@ -105,10 +105,10 @@
         "data:auth/mcp.json"
       ],
       "restoreOnStart": true,
-      "snapshotIntervalS": 120,
+      "snapshotIntervalS": 15,
       "treeEnabled": true,
       "treeKey": "state/data-tree",
-      "treeSnapshotIntervalS": 300,
+      "treeSnapshotIntervalS": 15,
       "treeMaxBytes": 40000000
     },
     "keepalive": {
