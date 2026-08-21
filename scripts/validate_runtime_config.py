@@ -316,6 +316,50 @@ check(
     True,
 )
 
+print("\n--- platform config reconcile (template fixes reach a restored config) ---")
+from nanobot.persistence import reconcile_platform_config as reconcile_mod  # noqa: E402
+
+reconcile_at = entrypoint.find("nanobot.persistence.reconcile_platform_config")
+copy_at = entrypoint.find("cp /app/render-config.json")
+check("reconcile runs after the config template copy", -1 < copy_at < reconcile_at, True)
+check("reconcile failure is non-fatal", "continuing with the stored config" in entrypoint, True)
+check(
+    "credentials are excluded from the reconcile",
+    sorted(reconcile_mod.CREDENTIAL_KEYS),
+    ["persistence.supabase.serviceKey", "persistence.supabase.url"],
+)
+
+# The exact situation that stranded the previous cadence change: a persisted
+# config carrying the old numbers plus live secrets.
+with tempfile.TemporaryDirectory() as tmp:
+    live_path = Path(tmp) / "config.json"
+    stored = json.loads(template.read_text())
+    stored["persistence"]["supabase"]["snapshotIntervalS"] = 120
+    stored["persistence"]["supabase"]["treeSnapshotIntervalS"] = 300
+    stored["persistence"]["supabase"]["url"] = "https://live.supabase.co"
+    stored["persistence"]["supabase"]["serviceKey"] = "sb_secret_live"
+    live_path.write_text(json.dumps(stored, indent=2))
+
+    applied = reconcile_mod.reconcile(live_path, template)
+    merged = json.loads(live_path.read_text())
+    check("cadence is corrected on a restored config", sorted(applied), [
+        "persistence.supabase.snapshotIntervalS",
+        "persistence.supabase.treeSnapshotIntervalS",
+    ])
+    check("json cadence after reconcile", merged["persistence"]["supabase"]["snapshotIntervalS"], 15)
+    check("tree cadence after reconcile", merged["persistence"]["supabase"]["treeSnapshotIntervalS"], 15)
+    check(
+        "live supabase url preserved",
+        merged["persistence"]["supabase"]["url"],
+        "https://live.supabase.co",
+    )
+    check(
+        "live service key preserved",
+        merged["persistence"]["supabase"]["serviceKey"],
+        "sb_secret_live",
+    )
+    check("second reconcile is a no-op", reconcile_mod.reconcile(live_path, template), {})
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S):")

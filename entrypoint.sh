@@ -40,6 +40,14 @@ if [ "$RENDER" = "true" ]; then
     else
         echo "[entrypoint] existing $config found — leaving it in place"
     fi
+    # The restored config wins by design, which strands deployment-owned fixes in
+    # the template: the mirror cadence was tightened here and the live instance
+    # kept the old numbers. Re-apply just those platform keys (never credentials,
+    # never user-edited sections) so infrastructure changes actually ship. The
+    # merged config is validated before it replaces anything, so a failure here
+    # leaves the working config untouched and is not fatal.
+    python -m nanobot.persistence.reconcile_platform_config || \
+        echo "[entrypoint] warning: platform config reconcile failed — continuing with the stored config"
     set -- "$@" --config "$config"
 fi
 
