@@ -17,8 +17,11 @@ Exit code 0 only when every check passes.
 from __future__ import annotations
 
 import argparse
+import base64
+import io
 import json
 import os
+import tarfile
 import sys
 from typing import Any, Callable
 
@@ -137,25 +140,37 @@ def check_supabase(report: Report) -> None:
     state: dict[str, Any] = {}
 
     def _row_exists() -> tuple[bool, str]:
+        # Keys only: the tree row carries a multi-megabyte archive, and pulling
+        # every payload just to list the keys would download all of it.
         with httpx.Client(timeout=_TIMEOUT) as client:
             response = client.get(
                 f"{url}/rest/v1/{table}",
                 headers=headers,
-                params={"select": "key,content", "limit": "20"},
+                params={"select": "key", "limit": "50"},
             )
         rows = response.json() if response.status_code < 400 else []
-        for row in rows:
-            state[row.get("key", "")] = row.get("content")
-        keys = sorted(state)
+        keys = sorted(r.get("key", "") for r in rows)
+        state["__keys__"] = keys
         return any("cron/jobs.json" in k for k in keys), f"rows: {keys or 'none'}"
 
     report.guard("mirrored cron state present", _row_exists)
 
+    def _fetch_row(row_key: str, select: str = "key,content") -> Any:
+        with httpx.Client(timeout=_TIMEOUT) as client:
+            response = client.get(
+                f"{url}/rest/v1/{table}",
+                headers=headers,
+                params={"select": select, "key": f"eq.{row_key}", "limit": "1"},
+            )
+        if response.status_code >= 400:
+            return None
+        rows = response.json()
+        return rows[0] if rows else None
+
     def _jobs_mirrored() -> tuple[bool, str]:
-        content = next(
-            (v for k, v in state.items() if "cron/jobs.json" in k and isinstance(v, (dict, list))),
-            None,
-        )
+        keys = [k for k in state.get("__keys__", []) if "cron/jobs.json" in k]
+        row = _fetch_row(keys[0]) if keys else None
+        content = row.get("content") if isinstance(row, dict) else None
         if content is None:
             return False, "no mirrored cron payload to inspect"
         blob = json.dumps(content)
@@ -172,6 +187,34 @@ def check_supabase(report: Report) -> None:
         return response.status_code in (401, 403, 404), f"anon read → HTTP {response.status_code}"
 
     report.guard("table not readable without the service key", _rls_blocks_anon)
+
+    tree_key = os.environ.get("NANOBOT_STATE_TREE_KEY", "state/data-tree")
+
+    def _tree_row_present() -> tuple[bool, str]:
+        row = _fetch_row(tree_key, select="key,content->file_count,content->byte_size")
+        if row is None:
+            return False, f"no '{tree_key}' row yet (the first snapshot lands ~5min after boot)"
+        count = row.get("file_count") or 0
+        size = row.get("byte_size") or 0
+        return int(count) > 0, f"{count} file(s), {size} bytes archived"
+
+    report.guard("whole-tree mirror row present", _tree_row_present)
+
+    def _tree_covers_user_state() -> tuple[bool, str]:
+        """Open the archive and confirm the state a restart used to destroy is in it."""
+        row = _fetch_row(tree_key)
+        content = row.get("content") if isinstance(row, dict) else None
+        if not isinstance(content, dict) or not content.get("data"):
+            return False, "no archive payload to inspect"
+        archive = base64.b64decode(content["data"])
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+            names = tar.getnames()
+        has_config = "config.json" in names
+        has_workspace = any(n.startswith("workspace/") for n in names)
+        detail = f"{len(names)} member(s); config.json={has_config}, workspace={has_workspace}"
+        return has_config and has_workspace, detail
+
+    report.guard("archived tree carries config.json and the workspace", _tree_covers_user_state)
 
 
 def check_composio(report: Report) -> None:

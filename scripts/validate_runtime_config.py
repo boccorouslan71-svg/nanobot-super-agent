@@ -167,6 +167,83 @@ if built is not None:
 # A host that injects nothing must degrade to "no keepalive", never crash boot.
 check("keepalive degrades without a public url", build_keepalive(config, environ={}), None)
 
+print("\n--- whole-tree state mirror (config, skills, workspace, sessions) ---")
+import asyncio  # noqa: E402
+
+from nanobot.persistence import TreeArchiveMirror  # noqa: E402
+
+tree_cfg = config.persistence.supabase
+check("tree mirror enabled", tree_cfg.tree_enabled, True)
+check("tree row key", tree_cfg.tree_key, "state/data-tree")
+check("tree snapshot cadence", tree_cfg.tree_snapshot_interval_s, 300)
+check("tree size limit", tree_cfg.tree_max_bytes, 40000000)
+# Write-heavy or regenerable paths stay out; everything else is user state.
+for skipped in ("logs", "media", "__pycache__", "node_modules"):
+    check(f"tree excludes '{skipped}'", skipped in tree_cfg.tree_excludes, True)
+
+# End-to-end round trip against an in-memory store: this is the behaviour the
+# deployment depends on, so it is checked here rather than assumed from config.
+class _MemoryStore:
+    def __init__(self) -> None:
+        self.rows: dict[str, object] = {}
+
+    async def pull(self, key: str):
+        return {"key": key, "content": self.rows[key]} if key in self.rows else None
+
+    async def push(self, key: str, content: object) -> str:
+        self.rows[key] = content
+        return "digest"
+
+
+async def _round_trip() -> tuple[int, dict[str, str], bool]:
+    with tempfile.TemporaryDirectory() as old_dir, tempfile.TemporaryDirectory() as new_dir:
+        old, new = Path(old_dir), Path(new_dir)
+        (old / "workspace" / "skills" / "make").mkdir(parents=True)
+        (old / "sessions").mkdir(parents=True)
+        (old / "logs").mkdir(parents=True)
+        (old / "config.json").write_text('{"providers": {"gemini": {"apiKey": "runtime-key"}}}')
+        (old / "workspace" / "skills" / "make" / "SKILL.md").write_text("# Make")
+        (old / "workspace" / "notes.md").write_text("agent work")
+        (old / "sessions" / "telegram.json").write_text('{"messages": [1]}')
+        (old / "logs" / "app.log").write_text("noise")
+
+        store = _MemoryStore()
+        pushed = await TreeArchiveMirror(
+            store=store, root=old, key=tree_cfg.tree_key, excludes=tree_cfg.tree_excludes
+        ).snapshot()
+        restored = await TreeArchiveMirror(
+            store=store, root=new, key=tree_cfg.tree_key, excludes=tree_cfg.tree_excludes
+        ).restore()
+        contents = {
+            name: (new / name).read_text()
+            for name in ("config.json", "workspace/notes.md")
+        }
+        return pushed, contents, "logs/app.log" in restored
+
+
+pushed_count, restored_contents, logs_leaked = asyncio.run(_round_trip())
+check("tree snapshot pushed the user's files", pushed_count, 4)
+check(
+    "provider keys survive a cold start",
+    "runtime-key" in restored_contents["config.json"],
+    True,
+)
+check("workspace work survives a cold start", restored_contents["workspace/notes.md"], "agent work")
+check("excluded logs are not restored", logs_leaked, False)
+
+# Ordering in entrypoint.sh is load-bearing: a restore that runs after the
+# config template is written can never bring back edited provider settings.
+entrypoint = (repo / "entrypoint.sh").read_text()
+restore_at = entrypoint.find("nanobot.persistence.bootstrap")
+template_at = entrypoint.find("cp /app/render-config.json")
+check("entrypoint runs the state restore", restore_at > -1, True)
+check("state restore precedes the config template copy", -1 < restore_at < template_at, True)
+check(
+    "entrypoint fails closed when the restore fails",
+    "refusing to start" in entrypoint,
+    True,
+)
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S):")

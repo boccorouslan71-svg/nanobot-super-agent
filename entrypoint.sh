@@ -11,9 +11,23 @@ if [ "$RENDER" = "true" ]; then
     echo "[entrypoint] Render deploy — starting as $(id)"
     mkdir -p "$dir" || echo "[entrypoint] warning: mkdir $dir failed"
     config="$dir/config.json"
+    # Restore durable state BEFORE the config template is written and before
+    # nanobot reads anything from disk. This host has no persistent disk, so the
+    # whole data dir (config.json with its provider keys, self-installed skills,
+    # workspace files, session history, MCP tokens) arrives from the Supabase
+    # mirror. Ordering is load-bearing twice over: a restore after the template
+    # copy would find config.json present and keep the pristine template
+    # forever, and a restore after startup could not affect the config already
+    # loaded in memory.
+    # Fail closed on error: booting with an empty tree would let the next
+    # snapshot overwrite a healthy mirror with nothing.
+    if ! python -m nanobot.persistence.bootstrap; then
+        echo "[entrypoint] error: durable state restore failed — refusing to start" >&2
+        exit 1
+    fi
     # Initialize config only when it does not already exist, so WebUI/provider
-    # settings edited at runtime survive restarts. The disk persists config.json
-    # across deploys; overwriting it every boot would discard those changes.
+    # settings edited at runtime survive restarts — they come back through the
+    # restore above, which is what makes this branch a genuine first-boot path.
     if [ ! -f "$config" ]; then
         echo "[entrypoint] initializing $config from render-config.json"
         cp /app/render-config.json "$config" || echo "[entrypoint] warning: cp config failed"

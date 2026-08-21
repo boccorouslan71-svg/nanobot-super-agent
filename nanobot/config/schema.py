@@ -10,6 +10,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from nanobot.config.timezone import detect_system_timezone
 from nanobot.config_base import Base
 from nanobot.cron.types import CronSchedule
+# Single source of truth for what the whole-tree mirror skips. Imported rather
+# than duplicated so the config default and the mirror can never drift apart.
+from nanobot.persistence.tree_mirror import DEFAULT_TREE_EXCLUDES as _DEFAULT_TREE_EXCLUDES
 
 if TYPE_CHECKING:
     from nanobot.agent.tools.cli_apps import CliAppsToolConfig
@@ -532,7 +535,6 @@ class CronBootstrapConfig(Base):
 
 class SupabasePersistenceConfig(Base):
     """Mirror ephemeral runtime state into Supabase (PostgREST) so it survives restarts."""
-
     enabled: bool = False
     url: str | None = None  # e.g. https://<ref>.supabase.co
     service_key: str | None = None  # Secret/service key; inject via environment only
@@ -547,6 +549,18 @@ class SupabasePersistenceConfig(Base):
     restore_on_start: bool = True  # Pull remote state before the cron service starts
     snapshot_interval_s: int = Field(default=120, ge=15)  # Background snapshot cadence
     timeout_s: float = Field(default=15.0, gt=0)
+    # Whole-tree mirror. 'paths' can only carry a hand-listed set of JSON files,
+    # which leaves out everything a user actually accumulates: provider keys in
+    # config.json, self-installed skills, workspace files, session history. On a
+    # host with no disk that state is destroyed by every container recycle, so
+    # the tree mirror archives the entire data directory instead.
+    tree_enabled: bool = True
+    tree_key: str = "state/data-tree"  # Supabase row key holding the archive
+    tree_excludes: list[str] = Field(default_factory=lambda: list(_DEFAULT_TREE_EXCLUDES))
+    tree_max_bytes: int = Field(default=40_000_000, gt=0)  # Refuse to push more than this
+    # Archiving the whole tree costs more than serialising one JSON file, so it
+    # runs on its own, slower cadence. A crash loses at most this much work.
+    tree_snapshot_interval_s: int = Field(default=300, ge=30)
 
     @model_validator(mode="after")
     def _validate_credentials(self) -> "SupabasePersistenceConfig":

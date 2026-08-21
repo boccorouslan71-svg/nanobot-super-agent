@@ -327,6 +327,44 @@ def _build_state_mirror(config: Any) -> Any | None:
     )
 
 
+def _build_tree_mirror(config: Any) -> Any | None:
+    """Build the whole-tree Supabase mirror when persistence is configured.
+
+    Separate from :func:`_build_state_mirror` because the two answer different
+    questions: that one mirrors a known list of JSON documents, this one carries
+    everything else the container would lose — config.json (provider keys and
+    channel settings edited in the WebUI), self-installed skills, workspace
+    files, session history. Same credentials, same table, one archive row.
+    """
+    mirror_cfg = config.persistence.supabase
+    if not mirror_cfg.enabled or not mirror_cfg.tree_enabled:
+        return None
+    if _is_unresolved_placeholder(mirror_cfg.url) or _is_unresolved_placeholder(
+        mirror_cfg.service_key
+    ):
+        return None
+
+    from nanobot.persistence import SupabaseStateStore, TreeArchiveMirror
+
+    store = SupabaseStateStore(
+        url=mirror_cfg.url or "",
+        service_key=mirror_cfg.service_key or "",
+        table=mirror_cfg.table,
+        # The archive is orders of magnitude larger than a JSON document, so it
+        # gets a longer budget than the per-file mirror's default.
+        timeout_s=max(mirror_cfg.timeout_s, 60.0),
+    )
+    from nanobot.config.paths import get_data_dir
+
+    return TreeArchiveMirror(
+        store=store,
+        root=get_data_dir(),
+        key=mirror_cfg.tree_key,
+        excludes=mirror_cfg.tree_excludes,
+        max_bytes=mirror_cfg.tree_max_bytes,
+    )
+
+
 def _build_keepalive(config: Any) -> Any | None:
     """Build the free-tier self-ping keepalive when it is configured.
 
@@ -466,6 +504,7 @@ def _run_gateway(
     # On hosts without a persistent disk the workspace is empty on boot; the
     # mirror repopulates it so scheduled jobs and sessions survive a redeploy.
     state_mirror = _build_state_mirror(config)
+    tree_mirror = _build_tree_mirror(config)
     keepalive = _build_keepalive(config)
     if keepalive is not None:
         console.print(
@@ -486,6 +525,25 @@ def _run_gateway(
                 )
             else:
                 console.print("[green]✓[/green] Supabase state mirror: local state is current")
+
+    if tree_mirror is not None and config.persistence.supabase.restore_on_start:
+        from nanobot.persistence import SupabasePersistenceError
+
+        # entrypoint.sh already ran this before the config was loaded, which is
+        # the only way config.json itself can be restored in time. Running it
+        # again here covers every other start path (local Docker, `nanobot
+        # gateway` by hand) and is a no-op when the tree is already complete.
+        try:
+            restored_files = asyncio.run(tree_mirror.restore())
+        except SupabasePersistenceError as exc:
+            console.print(f"[yellow]○[/yellow] Supabase tree restore skipped: {exc}")
+        else:
+            if restored_files:
+                console.print(
+                    f"[green]✓[/green] Supabase tree restored: {len(restored_files)} file(s)"
+                )
+            else:
+                console.print("[green]✓[/green] Supabase tree mirror: local tree is current")
 
     # Create cron service with workspace-scoped store
     cron_store_path = config.workspace_path / "cron" / "jobs.json"
@@ -996,6 +1054,13 @@ def _run_gateway(
                 tasks.append(asyncio.create_task(
                     state_mirror.run_forever(config.persistence.supabase.snapshot_interval_s),
                     name="nanobot-supabase-mirror",
+                ))
+            if tree_mirror is not None:
+                tasks.append(asyncio.create_task(
+                    tree_mirror.run_forever(
+                        config.persistence.supabase.tree_snapshot_interval_s
+                    ),
+                    name="nanobot-supabase-tree-mirror",
                 ))
             if keepalive is not None:
                 tasks.append(asyncio.create_task(

@@ -11,12 +11,20 @@ from nanobot.persistence.supabase_store import (
     SupabaseStateStore,
     WorkspaceStateMirror,
 )
+from nanobot.persistence.tree_mirror import (
+    DEFAULT_TREE_EXCLUDES,
+    TreeArchiveMirror,
+    TreeArchivePayload,
+)
 
 __all__ = [
+    "DEFAULT_TREE_EXCLUDES",
     "KeepaliveError",
     "SelfPingKeepalive",
     "SupabasePersistenceError",
     "SupabaseStateStore",
+    "TreeArchiveMirror",
+    "TreeArchivePayload",
     "WorkspaceStateMirror",
     "build_keepalive",
     "resolve_public_base_url",
