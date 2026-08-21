@@ -432,6 +432,118 @@ class CliAppManager:
     def installed_path(self) -> Path:
         return self.data_dir / "installed.json"
 
+    @property
+    def env_dir(self) -> Path:
+        """Return the virtualenv that owns installed apps' Python dependencies.
+
+        Deliberately named ``.venv``: the durable tree archive already excludes
+        that segment, so an app's dependency tree can never grow the archive
+        past its size limit and take config and cron state down with it.
+        """
+        return self.data_dir / ".venv"
+
+    def _env_bin_dir(self) -> Path:
+        return self.env_dir / ("Scripts" if sys.platform == "win32" else "bin")
+
+    def _env_python(self) -> Path:
+        return self._env_bin_dir() / ("python.exe" if sys.platform == "win32" else "python")
+
+    def env_ready(self) -> bool:
+        """Return whether the isolated app environment already exists."""
+        return self._env_python().is_file()
+
+    def _env_pip_available(self) -> bool:
+        """Return whether the isolated app environment carries its own pip."""
+        return (self._env_bin_dir() / ("pip.exe" if sys.platform == "win32" else "pip")).is_file()
+
+    def _ensure_app_env(self) -> Path:
+        """Create the isolated app environment on demand, returning its python.
+
+        Apps used to install through nanobot's own interpreter, which let a
+        single app rewrite a core dependency — one install downgraded the MCP
+        package below the supported floor and broke startup. Installs land here
+        instead. System site packages stay readable so the environment stays
+        small and apps can import what the core already ships, while writes
+        never reach the core interpreter.
+        """
+        python = self._env_python()
+        if python.is_file():
+            return python
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        timeout = max(30, min(self.runtime.install_timeout, 600))
+        attempts: list[list[str]] = [
+            [sys.executable, "-m", "venv", "--system-site-packages", str(self.env_dir)]
+        ]
+        uv = shutil.which("uv")
+        if uv:
+            # Fallback for images built without ensurepip.
+            attempts.append(
+                [
+                    uv,
+                    "venv",
+                    "--system-site-packages",
+                    "--python",
+                    sys.executable,
+                    str(self.env_dir),
+                ]
+            )
+        errors: list[str] = []
+        for argv in attempts:
+            result = self._run_argv(argv, timeout=timeout)
+            if result.returncode == 0 and python.is_file():
+                return python
+            errors.append(_truncate((result.stderr or result.stdout or "").strip(), 500))
+        detail = " | ".join(error for error in errors if error)
+        raise CliAppError(
+            f"could not create the isolated environment for CLI apps: {detail}",
+            status=500,
+        )
+
+    def _path_with_app_env(self, fallback: str) -> str:
+        """Return PATH with the app environment's bin dir taking precedence."""
+        path = os.environ.get("PATH", fallback)
+        bin_dir = self._env_bin_dir()
+        if not bin_dir.is_dir():
+            return path
+        entry = str(bin_dir)
+        parts = [part for part in path.split(os.pathsep) if part]
+        if entry in parts:
+            return path
+        return os.pathsep.join([entry, *parts])
+
+    def _which(self, command: str) -> str | None:
+        """Resolve a command, preferring the isolated app environment.
+
+        Console scripts for installed apps live in that environment's bin dir,
+        which is not on nanobot's own PATH, so a plain PATH lookup would report
+        a correctly installed app as missing.
+        """
+        if not command:
+            return None
+        bin_dir = self._env_bin_dir()
+        if bin_dir.is_dir():
+            found = shutil.which(command, path=str(bin_dir))
+            if found:
+                return found
+        return shutil.which(command)
+
+    def expose_env_on_path(self) -> None:
+        """Publish the app environment's bin dir on this process's PATH.
+
+        Other subsystems spawn app-provided commands knowing only PATH — an MCP
+        stdio server shipped by an app is the case that matters, since an
+        unresolvable command there used to cost a full connection timeout.
+        Idempotent, and a no-op until the environment exists.
+        """
+        bin_dir = self._env_bin_dir()
+        if not bin_dir.is_dir():
+            return
+        entry = str(bin_dir)
+        current = os.environ.get("PATH", "")
+        if entry in [part for part in current.split(os.pathsep) if part]:
+            return
+        os.environ["PATH"] = os.pathsep.join([entry, current]) if current else entry
+
     def _cache_path(self, source: str) -> Path:
         return self.data_dir / f"{source}_registry_cache.json"
 
@@ -676,7 +788,7 @@ class CliAppManager:
         entry_point = str(app.get("entry_point") or "")
         install_supported = self._install_supported(app)
         is_installed = name in installed
-        available = bool(entry_point and shutil.which(entry_point))
+        available = bool(entry_point and self._which(entry_point))
         if is_installed and available:
             status = "installed"
         elif is_installed:
@@ -711,7 +823,7 @@ class CliAppManager:
         name = ""
         if strategy == "pip":
             try:
-                uninstall = self._pip_uninstall_argv(app)
+                uninstall = self._pip_uninstall_argv(app, ensure_env=False)
             except CliAppError:
                 uninstall = None
             name = uninstall[-1] if uninstall else ""
@@ -855,6 +967,18 @@ class CliAppManager:
 
         return find_spec("pip") is not None
 
+    def _app_python(self, *, ensure: bool = True) -> str:
+        """Return the interpreter that owns app dependencies.
+
+        Every pip install/uninstall targets this instead of ``sys.executable``,
+        so an app can never rewrite a dependency the core runtime needs.
+
+        ``ensure=False`` names the path without building the environment, for
+        callers that only derive display metadata from the argv — listing the
+        catalog must not create an environment as a side effect.
+        """
+        return str(self._ensure_app_env() if ensure else self._env_python())
+
     def _pip_install_argv(self, app: dict[str, Any], *, update: bool = False) -> list[str]:
         install_cmd = str(app.get("install_cmd") or "")
         if not _is_pip_install_command(install_cmd) or _has_shell_meta(install_cmd):
@@ -862,10 +986,11 @@ class CliAppManager:
         tokens = shlex.split(install_cmd)
         args = tokens[2:] if tokens[:2] == ["pip", "install"] else tokens[4:]
         pip_available = self._pip_available()
+        app_python = self._app_python()
         if pip_available:
-            prefix = [sys.executable, "-m", "pip", "install"]
+            prefix = [app_python, "-m", "pip", "install"]
         elif shutil.which("uv"):
-            prefix = ["uv", "pip", "install", "--python", sys.executable]
+            prefix = ["uv", "pip", "install", "--python", app_python]
         else:
             raise CliAppError("pip is not available and uv is not installed")
         if update:
@@ -879,11 +1004,13 @@ class CliAppManager:
         self,
         app: dict[str, Any],
         installed_entry: dict[str, Any] | None = None,
+        *,
+        ensure_env: bool = True,
     ) -> list[str]:
         if self._pip_available():
-            prefix = [sys.executable, "-m", "pip", "uninstall", "-y"]
+            prefix = [self._app_python(ensure=ensure_env), "-m", "pip", "uninstall", "-y"]
         elif shutil.which("uv"):
-            prefix = ["uv", "pip", "uninstall", "--python", sys.executable]
+            prefix = ["uv", "pip", "uninstall", "--python", self._app_python(ensure=ensure_env)]
         else:
             raise CliAppError("pip is not available and uv is not installed")
         distribution = str((installed_entry or {}).get("pip_distribution") or "").strip()
@@ -1007,7 +1134,7 @@ class CliAppManager:
                 "TEMP": os.environ.get("TEMP", f"{sr}\\Temp"),
                 "TMP": os.environ.get("TMP", f"{sr}\\Temp"),
                 "PATHEXT": os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD"),
-                "PATH": os.environ.get("PATH", f"{sr}\\system32;{sr}"),
+                "PATH": self._path_with_app_env(f"{sr}\\system32;{sr}"),
                 "PYTHONUNBUFFERED": "1",
             }
             return env
@@ -1015,7 +1142,7 @@ class CliAppManager:
             "HOME": os.environ.get("HOME", "/tmp"),
             "LANG": os.environ.get("LANG", "C.UTF-8"),
             "TERM": os.environ.get("TERM", "dumb"),
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "PATH": self._path_with_app_env("/usr/bin:/bin"),
             "PYTHONUNBUFFERED": "1",
         }
 
@@ -1058,7 +1185,7 @@ class CliAppManager:
             value = app.get(field)
             if value not in (None, ""):
                 entry[field] = value
-        resolved = shutil.which(entry_point) if entry_point else None
+        resolved = self._which(entry_point) if entry_point else None
         if resolved:
             entry["entry_point_path"] = resolved
         if strategy == "pip":
@@ -1179,7 +1306,7 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
             raise CliAppError("this CLI app uses an unsupported install strategy")
         strategy = self._strategy(app)
         entry_point = str(app.get("entry_point") or "")
-        if entry_point and shutil.which(entry_point):
+        if entry_point and self._which(entry_point):
             self._record_installed(app)
             return self.payload() | {
                 "last_action": {
@@ -1268,7 +1395,7 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
             if result.returncode != 0:
                 raise CliAppError(_truncate(result.stderr or result.stdout or "uninstall failed"), status=500)
             still_managed = bool(managed_entry_path and Path(managed_entry_path).exists())
-            still_available = bool(entry_point and shutil.which(entry_point))
+            still_available = bool(entry_point and self._which(entry_point))
             if still_managed or (not managed_entry_path and still_available):
                 reason = (
                     f"the recorded entry point at {managed_entry_path} still exists"
@@ -1289,7 +1416,7 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
                     }
                 }
         else:
-            still_available = bool(entry_point and shutil.which(entry_point))
+            still_available = bool(entry_point and self._which(entry_point))
         installed.pop(str(app["name"]), None)
         self._save_installed(installed)
         self.remove_skill(str(app["name"]))
@@ -1320,7 +1447,7 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
     def test(self, name: str) -> dict[str, Any]:
         app = self.get_app(name)
         entry = str(app.get("entry_point") or "")
-        resolved = shutil.which(entry)
+        resolved = self._which(entry)
         if not entry or not resolved:
             raise CliAppError(f"{entry or name} is not available on PATH")
         result = self._run_argv([resolved, "--help"], timeout=min(self.runtime.run_timeout, 30))
@@ -1444,7 +1571,7 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
             raise CliAppError(f"CLI app '{name}' is not installed")
         cwd = self._resolve_cwd(working_dir, restrict_to_workspace=restrict_to_workspace)
         entry = str(installed[str(app["name"])].get("entry_point") or app.get("entry_point") or "")
-        resolved = shutil.which(entry)
+        resolved = self._which(entry)
         if not entry or not resolved:
             raise CliAppError(f"{entry or name} is not available on PATH")
         clean_args = [str(arg) for arg in (args or [])]

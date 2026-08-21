@@ -428,7 +428,7 @@ async def test_cli_app_scope_controls_working_dir(
     monkeypatch.setattr("nanobot.apps.cli.service.get_runtime_subdir", lambda _name: data_dir)
     monkeypatch.setattr(
         "nanobot.apps.cli.service.shutil.which",
-        lambda entry: "/usr/bin/demo-cli" if entry == "demo-cli" else None,
+        lambda entry, path=None: "/usr/bin/demo-cli" if entry == "demo-cli" else None,
     )
 
     seen: dict[str, str] = {}

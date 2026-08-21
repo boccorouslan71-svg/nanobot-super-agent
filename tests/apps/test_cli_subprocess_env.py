@@ -59,7 +59,7 @@ def test_run_passes_filtered_env(monkeypatch, tmp_path) -> None:
         "_load_installed",
         lambda: {"echo": {"entry_point": "echo"}},
     )
-    monkeypatch.setattr("nanobot.apps.cli.service.shutil.which", lambda entry: "/bin/echo")
+    monkeypatch.setattr("nanobot.apps.cli.service.shutil.which", lambda entry, path=None: "/bin/echo")
     monkeypatch.setattr(manager, "_resolve_cwd", lambda *a, **k: tmp_path)
     monkeypatch.setattr(manager, "_artifact_snapshot", lambda cwd: {})
     monkeypatch.setattr(manager, "_changed_artifacts", lambda cwd, snap: [])

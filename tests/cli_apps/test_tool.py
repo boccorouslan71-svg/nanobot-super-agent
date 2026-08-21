@@ -49,7 +49,7 @@ def test_run_cli_app_uses_installed_registry_app(
     resolved = str(tmp_path / "bin" / "cli-anything-gimp")
     monkeypatch.setattr(
         "nanobot.apps.cli.service.shutil.which",
-        lambda entry: resolved if entry == "cli-anything-gimp" else None,
+        lambda entry, path=None: resolved if entry == "cli-anything-gimp" else None,
     )
 
     def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:

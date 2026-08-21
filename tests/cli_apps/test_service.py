@@ -37,6 +37,18 @@ def _manager(tmp_path: Path) -> CliAppManager:
     )
 
 
+def _app_python(manager: CliAppManager) -> str:
+    """Materialize the isolated app interpreter so installs need no real venv.
+
+    Installs target this interpreter, never nanobot's own, so an app can no
+    longer rewrite a core dependency.
+    """
+    python = manager._env_python()
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.touch()
+    return str(python)
+
+
 def _seed_catalog(manager: CliAppManager) -> None:
     harness = {
         "meta": {"updated": "2026-04-16"},
@@ -393,6 +405,7 @@ def test_install_dispatches_safe_pip_and_installs_skill(
 
     monkeypatch.setattr(manager, "_run_argv", fake_run)
     monkeypatch.setattr(manager, "_pip_available", staticmethod(lambda: True))
+    app_python = _app_python(manager)
     monkeypatch.setattr(
         manager,
         "_fetch_skill_content",
@@ -404,7 +417,7 @@ def test_install_dispatches_safe_pip_and_installs_skill(
 
     payload = manager.install("gimp")
 
-    assert calls == [[sys.executable, "-m", "pip", "install", "cli-anything-gimp"]]
+    assert calls == [[app_python, "-m", "pip", "install", "cli-anything-gimp"]]
     assert payload["last_action"]["ok"] is True
     assert payload["last_action"]["installed"] is True
     assert "state_recorded" in payload["last_action"]["verification"]
@@ -496,7 +509,7 @@ def test_install_records_available_cli_without_reinstalling(
     monkeypatch.setattr(manager, "_run_argv", fail_run)
     monkeypatch.setattr(
         "nanobot.apps.cli.service.shutil.which",
-        lambda command: str(resolved) if command == "lark-cli" else None,
+        lambda command, path=None: str(resolved) if command == "lark-cli" else None,
     )
 
     payload = manager.install("feishu")
@@ -562,7 +575,7 @@ def test_install_recovers_stale_npm_global_directory(
     monkeypatch.setattr(manager, "_run_argv", fake_run)
     monkeypatch.setattr(
         "nanobot.apps.cli.service.shutil.which",
-        lambda command: npm if command == "npm" else None,
+        lambda command, path=None: npm if command == "npm" else None,
     )
 
     payload = manager.install("hyperframes")
@@ -597,7 +610,7 @@ def test_install_records_entry_point_path_and_pip_distribution(
     )
     monkeypatch.setattr(
         "nanobot.apps.cli.service.shutil.which",
-        lambda command: str(resolved) if command == "cli-anything-gimp" else None,
+        lambda command, path=None: str(resolved) if command == "cli-anything-gimp" else None,
     )
     monkeypatch.setattr(
         "nanobot.apps.cli.service.importlib_metadata.distributions",
@@ -723,6 +736,7 @@ def test_uninstall_removes_installed_state_and_generated_skill(
     manager = _manager(tmp_path)
     _seed_catalog(manager)
     manager._save_installed({"gimp": {"entry_point": "cli-anything-gimp"}})
+    app_python = _app_python(manager)
     plugin_dir = manager.workspace / "plugins" / "cli-app-gimp"
     skill_dir = plugin_dir / "skills" / "cli-app-gimp"
     skill_dir.mkdir(parents=True)
@@ -755,10 +769,11 @@ def test_uninstall_uses_safe_python_m_pip_uninstall_command(
 
     monkeypatch.setattr(manager, "_run_argv", fake_run)
     monkeypatch.setattr(manager, "_pip_available", staticmethod(lambda: True))
+    app_python = _app_python(manager)
 
     payload = manager.uninstall("suno")
 
-    assert calls == [[sys.executable, "-m", "pip", "uninstall", "-y", "suno-cli"]]
+    assert calls == [[app_python, "-m", "pip", "uninstall", "-y", "suno-cli"]]
     assert payload["last_action"]["ok"] is True
 
 
@@ -783,10 +798,11 @@ def test_uninstall_uses_recorded_pip_distribution(
 
     monkeypatch.setattr(manager, "_run_argv", fake_run)
     monkeypatch.setattr(manager, "_pip_available", staticmethod(lambda: True))
+    app_python = _app_python(manager)
 
     payload = manager.uninstall("gimp")
 
-    assert calls == [[sys.executable, "-m", "pip", "uninstall", "-y", "actual-dist-name"]]
+    assert calls == [[app_python, "-m", "pip", "uninstall", "-y", "actual-dist-name"]]
     assert payload["last_action"]["ok"] is True
     assert payload["last_action"]["removed"] is True
     assert "entry_point_absent" in payload["last_action"]["verification"]
@@ -800,6 +816,7 @@ def test_uninstall_keeps_state_when_entry_point_still_available(
     manager = _manager(tmp_path)
     _seed_catalog(manager)
     manager._save_installed({"gimp": {"entry_point": "cli-anything-gimp"}})
+    app_python = _app_python(manager)
     monkeypatch.setattr(
         manager,
         "_run_argv",
@@ -808,7 +825,7 @@ def test_uninstall_keeps_state_when_entry_point_still_available(
     monkeypatch.setattr(manager, "_pip_available", staticmethod(lambda: True))
     monkeypatch.setattr(
         "nanobot.apps.cli.service.shutil.which",
-        lambda command: "/usr/local/bin/cli-anything-gimp" if command == "cli-anything-gimp" else None,
+        lambda command, path=None: "/usr/local/bin/cli-anything-gimp" if command == "cli-anything-gimp" else None,
     )
 
     payload = manager.uninstall("gimp")
@@ -836,6 +853,7 @@ def test_uninstall_keeps_state_when_recorded_entry_point_still_exists(
             "entry_point_path": str(resolved),
         }
     })
+    _app_python(manager)
     monkeypatch.setattr(
         manager,
         "_run_argv",
@@ -941,7 +959,7 @@ def test_run_installed_cli_uses_argv_without_shell(
     resolved = str(tmp_path / "bin" / "cli-anything-gimp")
     monkeypatch.setattr(
         "nanobot.apps.cli.service.shutil.which",
-        lambda entry: resolved if entry == "cli-anything-gimp" else None,
+        lambda entry, path=None: resolved if entry == "cli-anything-gimp" else None,
     )
 
     def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -983,7 +1001,7 @@ def test_run_reports_created_artifacts(
     resolved = str(tmp_path / "bin" / "cli-anything-gimp")
     monkeypatch.setattr(
         "nanobot.apps.cli.service.shutil.which",
-        lambda entry: resolved if entry == "cli-anything-gimp" else None,
+        lambda entry, path=None: resolved if entry == "cli-anything-gimp" else None,
     )
 
     def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -1025,10 +1043,11 @@ def test_install_uses_uv_pip_when_pip_unavailable(
     monkeypatch.setattr(CliAppManager, "_pip_available", staticmethod(lambda: False))
     monkeypatch.setattr(
         "nanobot.apps.cli.service.shutil.which",
-        lambda command: "/usr/bin/uv" if command == "uv" else None,
+        lambda command, path=None: "/usr/bin/uv" if command == "uv" else None,
     )
     monkeypatch.setattr(manager, "_run_argv", fake_run)
     monkeypatch.setattr(manager, "_fetch_skill_content", lambda app: None)
+    app_python = _app_python(manager)
 
     manager.install("gimp")
 
@@ -1037,7 +1056,7 @@ def test_install_uses_uv_pip_when_pip_unavailable(
         "pip",
         "install",
         "--python",
-        sys.executable,
+        app_python,
         "cli-anything-gimp",
     ]
 
@@ -1050,8 +1069,10 @@ def test_update_uses_uv_pip_reinstall_when_pip_unavailable(
     monkeypatch.setattr(CliAppManager, "_pip_available", staticmethod(lambda: False))
     monkeypatch.setattr(
         "nanobot.apps.cli.service.shutil.which",
-        lambda command: "/usr/bin/uv" if command == "uv" else None,
+        lambda command, path=None: "/usr/bin/uv" if command == "uv" else None,
     )
+
+    app_python = _app_python(manager)
 
     argv = manager._pip_install_argv(
         {"name": "gimp", "install_cmd": "pip install cli-anything-gimp"},
@@ -1063,7 +1084,7 @@ def test_update_uses_uv_pip_reinstall_when_pip_unavailable(
         "pip",
         "install",
         "--python",
-        sys.executable,
+        app_python,
         "--upgrade",
         "--reinstall",
         "cli-anything-gimp",
@@ -1086,9 +1107,10 @@ def test_uninstall_uses_uv_pip_when_pip_unavailable(
     monkeypatch.setattr(CliAppManager, "_pip_available", staticmethod(lambda: False))
     monkeypatch.setattr(
         "nanobot.apps.cli.service.shutil.which",
-        lambda command: "/usr/bin/uv" if command == "uv" else None,
+        lambda command, path=None: "/usr/bin/uv" if command == "uv" else None,
     )
     monkeypatch.setattr(manager, "_run_argv", fake_run)
+    app_python = _app_python(manager)
 
     manager.uninstall("suno")
 
@@ -1097,6 +1119,6 @@ def test_uninstall_uses_uv_pip_when_pip_unavailable(
         "pip",
         "uninstall",
         "--python",
-        sys.executable,
+        app_python,
         "suno-cli",
     ]
