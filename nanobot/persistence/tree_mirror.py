@@ -74,6 +74,16 @@ DEFAULT_TREE_EXCLUDES: tuple[str, ...] = (
     "node_modules",
     ".venv",
     ".cache",
+    # Rendered video. The photo-zoom-video skill writes clips into the workspace,
+    # and a handful of them outweighs every text file the mirror exists to
+    # protect — a 40 MB archive limit reached is a mirror that fails wholesale,
+    # taking the config and cron state down with it. A clip is reproducible from
+    # its source photo and one command, so it is regenerated, never archived.
+    "**/*.mp4",
+    "**/*.mov",
+    "**/*.mkv",
+    "**/*.webm",
+    "**/*.m4v",
     "**/*.pyc",
     "**/*.pyo",
     "**/*.sock",

@@ -238,3 +238,43 @@ async def test_executable_bit_survives_a_round_trip(tmp_path: Path) -> None:
     await _mirror(fresh, store).restore()
 
     assert (fresh / "workspace" / "run.sh").stat().st_mode & 0o111
+
+
+class TestRenderedVideoStaysOutOfTheArchive:
+    """Generated clips must not be able to break the mirror they share a disk with.
+
+    The photo-zoom-video skill writes mp4s into the workspace. They are large,
+    they accumulate, and the archive fails *wholesale* past its size cap — so a
+    batch of clips could take config.json and the cron store down with it. A clip
+    is reproducible from its source photo and one command; durable state is not.
+    """
+
+    def test_clips_are_excluded_but_their_sources_are_kept(self, tmp_path: Path) -> None:
+        root = _tree(tmp_path)
+        (root / "output").mkdir(parents=True)
+        (root / "output" / "holiday_zoom.mp4").write_bytes(os.urandom(3_000_000))
+        (root / "output" / "reel.mov").write_bytes(os.urandom(1_000_000))
+        (root / "output" / "clip.webm").write_bytes(os.urandom(500_000))
+        (root / "output" / "source.jpg").write_bytes(os.urandom(40_000))
+        (root / "output" / "caption.md").write_text("the copy that goes with the clip")
+
+        names = {p.relative_to(root).as_posix() for p in _mirror(root, FakeStore()).iter_files()}
+
+        assert "output/holiday_zoom.mp4" not in names
+        assert "output/reel.mov" not in names
+        assert "output/clip.webm" not in names
+        # The inputs and the text around them are exactly what must survive.
+        assert "output/source.jpg" in names
+        assert "output/caption.md" in names
+
+    def test_a_batch_of_clips_cannot_blow_the_size_cap(self, tmp_path: Path) -> None:
+        root = _tree(tmp_path)
+        (root / "output").mkdir(parents=True)
+        for index in range(12):
+            (root / "output" / f"clip{index:02d}.mp4").write_bytes(os.urandom(4_000_000))
+
+        # 48 MB of clips on disk, and the archive still builds well under its cap.
+        archive, count = _mirror(root, FakeStore(), max_bytes=1_000_000).build_archive()
+
+        assert count > 0
+        assert len(archive) < 1_000_000

@@ -274,10 +274,15 @@ from nanobot.persistence import seed_skills  # noqa: E402
 shipped = repo / "seed-skills"
 check("seed tree is committed", shipped.is_dir(), True)
 names = sorted(p.name for p in shipped.iterdir() if p.is_dir()) if shipped.is_dir() else []
-check("skills shipped in the image", names, ["agnes-image", "cloudflare-ai-image", "hugging-face-image"])
+check(
+    "skills shipped in the image",
+    names,
+    ["agnes-image", "cloudflare-ai-image", "hugging-face-image", "photo-zoom-video"],
+)
 for name in names:
     check(f"{name} has SKILL.md", (shipped / name / "SKILL.md").is_file(), True)
-    check(f"{name} has a runnable script", (shipped / name / "scripts" / "gen_image.py").is_file(), True)
+    scripts = sorted(p.name for p in (shipped / name / "scripts").glob("*.py"))
+    check(f"{name} has a runnable script", bool(scripts), True)
 
 with tempfile.TemporaryDirectory() as seed_dir:
     root = Path(seed_dir) / "workspace" / "skills"
@@ -301,6 +306,56 @@ seed_at = entrypoint_text.find("nanobot.persistence.seed_skills")
 restore_at2 = entrypoint_text.find("nanobot.persistence.bootstrap")
 check("skills are seeded after the durable restore", -1 < restore_at2 < seed_at, True)
 check("seeding failure is non-fatal", "continuing without it" in entrypoint_text, True)
+
+print("\n--- photo -> zoom video skill (ffmpeg dependency + mirror safety) ---")
+dockerfile = (repo / "Dockerfile").read_text()
+# The skill is dead weight without the binary, and the loader would hide it as
+# unavailable — so the image must ship ffmpeg, not just the script.
+check("image installs ffmpeg", "ffmpeg" in dockerfile, True)
+apt_line = next((line for line in dockerfile.splitlines() if "apt-get install" in line), "")
+check("ffmpeg is on the apt install line", "ffmpeg" in apt_line, True)
+
+zoom_skill = shipped / "photo-zoom-video"
+zoom_meta = json.loads(
+    (zoom_skill / "SKILL.md").read_text().split("metadata:", 1)[1].strip().splitlines()[0]
+)
+check(
+    "skill declares its binaries",
+    zoom_meta["nanobot"]["requires"]["bins"],
+    ["ffmpeg", "ffprobe"],
+)
+zoom_description = (
+    (zoom_skill / "SKILL.md").read_text().split("description:", 1)[1].split("\n", 1)[0].lower()
+)
+check("skill triggers on a French zoom-video request", "vidéo zoom" in zoom_description, True)
+check(
+    "skill script is executable python",
+    (zoom_skill / "scripts" / "zoom_video.py").is_file(),
+    True,
+)
+
+# Rendered clips share the workspace with durable state, and the archive fails
+# wholesale past its cap — so they must be excluded, while their sources are not.
+from nanobot.persistence.tree_mirror import DEFAULT_TREE_EXCLUDES  # noqa: E402
+
+for pattern in ("**/*.mp4", "**/*.mov", "**/*.webm"):
+    check(f"mirror excludes {pattern}", pattern in DEFAULT_TREE_EXCLUDES, True)
+check("mirror still archives photos", "**/*.jpg" not in DEFAULT_TREE_EXCLUDES, True)
+
+with tempfile.TemporaryDirectory() as clip_dir:
+    root = Path(clip_dir)
+    (root / "output").mkdir(parents=True)
+    (root / "config.json").write_text('{"providers": {}}')
+    (root / "output" / "source.jpg").write_bytes(os.urandom(30_000))
+    for index in range(8):
+        (root / "output" / f"clip{index}.mp4").write_bytes(os.urandom(4_000_000))
+    mirrored = {
+        p.relative_to(root).as_posix()
+        for p in TreeArchiveMirror(store=_MemoryStore(), root=root).iter_files()
+    }
+    check("32 MB of clips are not mirrored", [n for n in mirrored if n.endswith(".mp4")], [])
+    check("the source photo is mirrored", "output/source.jpg" in mirrored, True)
+    check("config.json is still mirrored", "config.json" in mirrored, True)
 check("Dockerfile ships the seed tree", "COPY seed-skills/" in (repo / "Dockerfile").read_text(), True)
 
 # Ordering in entrypoint.sh is load-bearing: a restore that runs after the
