@@ -555,9 +555,11 @@ class ComposioExecuteTool(_ComposioTool):
     ) -> Any:
         """Publish a story on a Facebook Page using the Page's own access token.
 
-        Photos: upload unpublished (url or local file) then reference photo_id.
-        Videos: download the video URL and multipart-upload it unpublished,
-        then reference video_id. Graph API only exposes stories for Pages.
+        Photos: upload unpublished (url or local file), then publish via the
+        /photo_stories edge referencing photo_id. Videos follow the
+        three-phase /video_stories flow (start session -> upload bytes to the
+        returned upload_url -> finish). Graph API only exposes stories for
+        Pages; the bare /stories edge is read-only and cannot publish.
         """
         page_id = str(args.get("page_id") or "").strip()
         if not page_id:
@@ -605,46 +607,68 @@ class ComposioExecuteTool(_ComposioTool):
 
         try:
             if is_video:
+                session = await self.client.post_url(
+                    f"{_FACEBOOK_GRAPH_BASE}/{page_id}/video_stories",
+                    {"access_token": page_token, "upload_phase": "start"},
+                )
+                video_id = str(session.get("video_id") or "")
+                upload_url = str(session.get("upload_url") or "")
+                if not video_id or not upload_url:
+                    return ToolResult.error(
+                        f"{slug_label} failed: could not start the video story "
+                        f"upload session: {session}"
+                    )
                 async with httpx.AsyncClient(timeout=120.0) as http:
                     media_response = await http.get(source or file_path)
                     media_response.raise_for_status()
                     media_bytes = media_response.content
                 filename = os.path.basename(file_path or "") or "story.mp4"
-                upload_body: dict[str, Any] = {"access_token": page_token, "published": "false"}
                 async with httpx.AsyncClient(timeout=300.0) as http:
                     response = await http.post(
-                        f"{_FACEBOOK_GRAPH_BASE}/{page_id}/videos",
-                        data=upload_body,
+                        upload_url,
                         files={"source": (filename, media_bytes)},
                     )
-                result_upload: dict[str, Any] = response.json()
-                media_key = "video_id"
-            elif file_path and not image_url:
-                with open(file_path, "rb") as fh:  # noqa: ASYNC230 - small local image files only
-                    async with httpx.AsyncClient(timeout=60.0) as http:
-                        response = await http.post(
-                            f"{_FACEBOOK_GRAPH_BASE}/{page_id}/photos",
-                            data={"access_token": page_token, "published": "false"},
-                            files={"source": (os.path.basename(file_path), fh)},
-                        )
-                result_upload = response.json()
-                media_key = "photo_id"
+                if response.status_code >= 400:
+                    return ToolResult.error(
+                        f"{slug_label} failed: video upload to Facebook returned "
+                        f"HTTP {response.status_code}"
+                    )
+                result = await self.client.post_url(
+                    f"{_FACEBOOK_GRAPH_BASE}/{page_id}/video_stories",
+                    {
+                        "access_token": page_token,
+                        "upload_phase": "finish",
+                        "video_id": video_id,
+                    },
+                )
             else:
-                result_upload = await self.client.post_url(
-                    f"{_FACEBOOK_GRAPH_BASE}/{page_id}/photos",
-                    {"access_token": page_token, "published": "false", "url": str(image_url)},
+                if file_path and not image_url:
+                    with open(file_path, "rb") as fh:  # noqa: ASYNC230 - small local image files only
+                        async with httpx.AsyncClient(timeout=60.0) as http:
+                            response = await http.post(
+                                f"{_FACEBOOK_GRAPH_BASE}/{page_id}/photos",
+                                data={"access_token": page_token, "published": "false"},
+                                files={"source": (os.path.basename(file_path), fh)},
+                            )
+                    result_upload = response.json()
+                else:
+                    result_upload = await self.client.post_url(
+                        f"{_FACEBOOK_GRAPH_BASE}/{page_id}/photos",
+                        {
+                            "access_token": page_token,
+                            "published": "false",
+                            "url": str(image_url),
+                        },
+                    )
+                photo_id = str(result_upload.get("id") or "")
+                if not photo_id:
+                    return ToolResult.error(
+                        f"{slug_label} failed: could not upload the story image: {result_upload}"
+                    )
+                result = await self.client.post_url(
+                    f"{_FACEBOOK_GRAPH_BASE}/{page_id}/photo_stories",
+                    {"access_token": page_token, "photo_id": photo_id},
                 )
-                media_key = "photo_id"
-
-            media_id = str(result_upload.get("id") or "")
-            if not media_id:
-                return ToolResult.error(
-                    f"{slug_label} failed: could not upload the story media: {result_upload}"
-                )
-            result = await self.client.post_url(
-                f"{_FACEBOOK_GRAPH_BASE}/{page_id}/stories",
-                {"access_token": page_token, media_key: media_id},
-            )
         except ComposioError as exc:
             return ToolResult.error(f"{slug_label} failed: {exc}")
         except OSError as exc:
