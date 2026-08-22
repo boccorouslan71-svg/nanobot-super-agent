@@ -322,7 +322,7 @@ def _post_url_fake(posts: list[dict[str, Any]]) -> Any:
     """Stand-in for the Graph API feed call; records every call made."""
 
     async def _post(url: str, json_body: dict[str, Any]) -> dict[str, Any]:
-        posts.append(json_body)
+        posts.append({"_url": url, **json_body})
         return {"id": "1192699313930831_feed_1"}
 
     return _post
@@ -457,6 +457,9 @@ async def test_facebook_create_story_uses_the_page_access_token() -> None:
     assert len(posted) == 2
     assert posted[0]["published"] == "false"
     assert posted[0]["url"] == "https://cdn.example.com/story.png"
+    # The story must be published through the dedicated photo_stories edge;
+    # the bare /stories edge is read-only and rejects writes.
+    assert posted[1]["_url"].endswith("/1192699313930831/photo_stories")
     assert posted[1]["photo_id"] == "1192699313930831_feed_1"
     assert "page-token-abc" not in result
 
