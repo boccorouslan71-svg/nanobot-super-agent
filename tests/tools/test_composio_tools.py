@@ -388,6 +388,58 @@ async def test_facebook_create_post_surfaces_graph_api_errors() -> None:
     assert "FACEBOOK_CREATE_POST failed" in str(result)
 
 
+async def test_facebook_create_post_matches_lowercase_slugs() -> None:
+    """Models sometimes emit 'facebook_create_post'; the Page-token branch must still fire."""
+    tool, fake = _tool(ComposioExecuteTool, [_PAGES_PAYLOAD])
+    posted: list[dict[str, Any]] = []
+    tool.client.post_url = _post_url_fake(posted)  # type: ignore[method-assign]
+
+    result = await tool.execute(
+        tool_slug="facebook_create_post",
+        arguments={"page_id": "1192699313930831", "message": "Salut"},
+    )
+
+    assert fake.calls[0]["path"] == "/tools/execute/FACEBOOK_GET_USER_PAGES"
+    assert len(posted) == 1
+    assert posted[0]["access_token"] == "page-token-abc"
+    assert "1192699313930831_feed_1" in result
+
+
+async def test_facebook_photo_post_uses_the_page_access_token() -> None:
+    tool, fake = _tool(ComposioExecuteTool, [_PAGES_PAYLOAD])
+    posted: list[dict[str, Any]] = []
+    tool.client.post_url = _post_url_fake(posted)  # type: ignore[method-assign]
+
+    result = await tool.execute(
+        tool_slug="FACEBOOK_CREATE_PHOTO_POST",
+        arguments={
+            "page_id": "1129160526949038",
+            "url": "https://cdn.example.com/promo.png",
+            "message": "Nouvelle promo",
+        },
+    )
+
+    assert fake.calls[0]["path"] == "/tools/execute/FACEBOOK_GET_USER_PAGES"
+    assert len(posted) == 1
+    assert posted[0]["access_token"] == "page-token-xyz"
+    assert posted[0]["url"] == "https://cdn.example.com/promo.png"
+    assert posted[0]["caption"] == "Nouvelle promo"
+    assert "page-token-xyz" not in result
+
+
+async def test_facebook_photo_post_requires_an_image() -> None:
+    tool, fake = _tool(ComposioExecuteTool, [])
+
+    result = await tool.execute(
+        tool_slug="facebook_upload_photo",
+        arguments={"page_id": "1129160526949038"},
+    )
+
+    assert result.is_error
+    assert "url" in result
+    assert not fake.calls
+
+
 # --- connect ----------------------------------------------------------------
 
 
