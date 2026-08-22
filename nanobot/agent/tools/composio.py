@@ -47,6 +47,7 @@ _API_KEY_ENV = "COMPOSIO_API_KEY"
 _MAX_RESULT_CHARS = 6000
 _FACEBOOK_GRAPH_BASE = "https://graph.facebook.com/v20.0"
 _FACEBOOK_CREATE_POST = "FACEBOOK_CREATE_POST"
+_FACEBOOK_PHOTO_SLUGS = frozenset({"FACEBOOK_CREATE_PHOTO_POST", "FACEBOOK_UPLOAD_PHOTO"})
 
 
 class ComposioToolsConfig(Base):
@@ -361,7 +362,9 @@ class ComposioExecuteTool(_ComposioTool):
     description = (  # pyright: ignore[reportIncompatibleMethodOverride, reportAssignmentType]
         "Execute a Composio tool by slug with an arguments object. Verify the argument names with "
         "composio_tool_schema first. If the app is not connected yet, use composio_connect to get "
-        "an authorization link for the owner."
+        "an authorization link for the owner. Facebook Page publishing (FACEBOOK_CREATE_POST, "
+        "FACEBOOK_CREATE_PHOTO_POST, FACEBOOK_UPLOAD_PHOTO) is routed through the Page access "
+        "token automatically, so just pass page_id and the content."
     )
 
     async def execute(self, **kwargs: Any) -> Any:
@@ -378,13 +381,22 @@ class ComposioExecuteTool(_ComposioTool):
             return ToolResult.error("'arguments' must be a JSON object.")
         user_id = self._user_id(kwargs.get("user_id"))
 
-        # FACEBOOK_CREATE_POST is special-cased: Composio authenticates it with
-        # the connection's user-level token, which the modern Facebook Pages API
-        # rejects (#200) when posting to a managed Page. Routing it instead
-        # through the Page's own access token (fetched via GET_USER_PAGES, which
-        # returns per-Page admin tokens) makes publishing work for the owner.
-        if tool_slug == _FACEBOOK_CREATE_POST:
+        # Facebook Page publishing tools are special-cased: Composio
+        # authenticates them with the connection's user-level token, which the
+        # modern Facebook Pages API rejects (#190/#200) when posting to a
+        # managed Page. Routing them instead through the Page's own access
+        # token (fetched via GET_USER_PAGES, which returns per-Page admin
+        # tokens) makes publishing work for the owner. The comparison is
+        # case-insensitive because models sometimes call e.g.
+        # "facebook_create_post" in lowercase and would silently miss this
+        # branch otherwise.
+        slug_key = tool_slug.upper()
+        if slug_key == _FACEBOOK_CREATE_POST:
             return await self._guarded(self._facebook_create_post(user_id, raw_args))
+        if slug_key in _FACEBOOK_PHOTO_SLUGS:
+            return await self._guarded(
+                self._facebook_photo_post(user_id, tool_slug, raw_args)
+            )
 
         async def _run() -> Any:
             payload = await self.client.request(
@@ -445,6 +457,86 @@ class ComposioExecuteTool(_ComposioTool):
             )
         except ComposioError as exc:
             return ToolResult.error(f"{_FACEBOOK_CREATE_POST} failed: {exc}")
+        return _truncate(result)
+
+    async def _facebook_photo_post(
+        self, user_id: str, slug_label: str, args: dict[str, Any]
+    ) -> Any:
+        """Publish a photo on a Facebook Page using the Page's own access token.
+
+        Accepts either a public image URL ('url'/'image_url'/'photo_url') or a
+        local file path ('file_path'/'image_path'), plus an optional caption
+        ('message'/'caption'). Mirrors the FACEBOOK_CREATE_PHOTO_POST schema.
+        """
+        page_id = str(args.get("page_id") or "").strip()
+        if not page_id:
+            return ToolResult.error("'page_id' is required to publish a photo on Facebook.")
+
+        image_url = str(
+            args.get("url") or args.get("image_url") or args.get("photo_url") or ""
+        ).strip() or None
+        file_path = str(
+            args.get("file_path") or args.get("image_path") or ""
+        ).strip() or None
+        caption = str(
+            args.get("message") or args.get("caption") or ""
+        ).strip() or None
+        if not image_url and not file_path:
+            return ToolResult.error(
+                f"{slug_label} failed: provide 'url' (public image URL) or "
+                "'file_path' (path to a local image file)."
+            )
+
+        try:
+            pages_payload = await self.client.request(
+                "POST",
+                "/tools/execute/FACEBOOK_GET_USER_PAGES",
+                json_body={"user_id": user_id, "arguments": {}},
+            )
+        except ComposioError as exc:
+            return ToolResult.error(f"Could not list Facebook pages to publish the photo: {exc}")
+
+        page_token = None
+        root = pages_payload.get("data")
+        if isinstance(root, dict) and isinstance(root.get("response_data"), dict):
+            root = root.get("response_data", {})
+        pages = root.get("data", []) if isinstance(root, dict) else []
+        for page in pages if isinstance(pages, list) else []:
+            if str(page.get("id")) == page_id:
+                page_token = page.get("access_token")
+                break
+        if not page_token:
+            return ToolResult.error(
+                f"No Page access token found for Facebook page '{page_id}' for user '{user_id}'. "
+                "Make sure the connected account manages this page, then retry."
+            )
+
+        body: dict[str, Any] = {"access_token": page_token}
+        if caption:
+            body["caption"] = caption
+        if file_path and not image_url:
+            try:
+                with open(file_path, "rb") as fh:  # noqa: ASYNC230 - small local image files only
+                    async with httpx.AsyncClient(timeout=60.0) as http:
+                        response = await http.post(
+                            f"{_FACEBOOK_GRAPH_BASE}/{page_id}/photos",
+                            data=body,
+                            files={"source": (os.path.basename(file_path), fh)},
+                        )
+                result: dict[str, Any] = response.json()
+            except ComposioError as exc:
+                return ToolResult.error(f"{slug_label} failed: {exc}")
+            except OSError as exc:
+                return ToolResult.error(f"{slug_label} failed: could not read '{file_path}': {exc}")
+        else:
+            body["url"] = str(image_url)
+            try:
+                result = await self.client.post_url(
+                    f"{_FACEBOOK_GRAPH_BASE}/{page_id}/photos",
+                    body,
+                )
+            except ComposioError as exc:
+                return ToolResult.error(f"{slug_label} failed: {exc}")
         return _truncate(result)
 
 
