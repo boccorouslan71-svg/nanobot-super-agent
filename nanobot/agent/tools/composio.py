@@ -48,6 +48,8 @@ _MAX_RESULT_CHARS = 6000
 _FACEBOOK_GRAPH_BASE = "https://graph.facebook.com/v20.0"
 _FACEBOOK_CREATE_POST = "FACEBOOK_CREATE_POST"
 _FACEBOOK_PHOTO_SLUGS = frozenset({"FACEBOOK_CREATE_PHOTO_POST", "FACEBOOK_UPLOAD_PHOTO"})
+_FACEBOOK_STORY_SLUGS = frozenset({"FACEBOOK_CREATE_STORY", "FACEBOOK_PUBLISH_STORY"})
+_FACEBOOK_PAGE_POSTS_SLUGS = frozenset({"FACEBOOK_GET_PAGE_POSTS"})
 
 
 class ComposioToolsConfig(Base):
@@ -363,8 +365,9 @@ class ComposioExecuteTool(_ComposioTool):
         "Execute a Composio tool by slug with an arguments object. Verify the argument names with "
         "composio_tool_schema first. If the app is not connected yet, use composio_connect to get "
         "an authorization link for the owner. Facebook Page publishing (FACEBOOK_CREATE_POST, "
-        "FACEBOOK_CREATE_PHOTO_POST, FACEBOOK_UPLOAD_PHOTO) is routed through the Page access "
-        "token automatically, so just pass page_id and the content."
+        "FACEBOOK_CREATE_PHOTO_POST, FACEBOOK_UPLOAD_PHOTO, FACEBOOK_CREATE_STORY) and Page reads "
+        "(facebook_get_page_posts) are routed through the Page access token automatically, so just "
+        "pass page_id and the content."
     )
 
     async def execute(self, **kwargs: Any) -> Any:
@@ -396,6 +399,14 @@ class ComposioExecuteTool(_ComposioTool):
         if slug_key in _FACEBOOK_PHOTO_SLUGS:
             return await self._guarded(
                 self._facebook_photo_post(user_id, tool_slug, raw_args)
+            )
+        if slug_key in _FACEBOOK_STORY_SLUGS:
+            return await self._guarded(
+                self._facebook_story_post(user_id, tool_slug, raw_args)
+            )
+        if slug_key in _FACEBOOK_PAGE_POSTS_SLUGS:
+            return await self._guarded(
+                self._facebook_get_page_posts(user_id, raw_args)
             )
 
         async def _run() -> Any:
@@ -537,6 +548,160 @@ class ComposioExecuteTool(_ComposioTool):
                 )
             except ComposioError as exc:
                 return ToolResult.error(f"{slug_label} failed: {exc}")
+        return _truncate(result)
+
+    async def _facebook_story_post(
+        self, user_id: str, slug_label: str, args: dict[str, Any]
+    ) -> Any:
+        """Publish a story on a Facebook Page using the Page's own access token.
+
+        Photos: upload unpublished (url or local file) then reference photo_id.
+        Videos: download the video URL and multipart-upload it unpublished,
+        then reference video_id. Graph API only exposes stories for Pages.
+        """
+        page_id = str(args.get("page_id") or "").strip()
+        if not page_id:
+            return ToolResult.error("'page_id' is required to publish a Facebook story.")
+
+        media_type = str(args.get("media_type") or "").strip().lower()
+        image_url = str(
+            args.get("url") or args.get("image_url") or args.get("photo_url") or ""
+        ).strip() or None
+        video_url = str(args.get("video_url") or "").strip() or None
+        file_path = str(
+            args.get("file_path") or args.get("image_path") or args.get("video_path") or ""
+        ).strip() or None
+        is_video = media_type == "video" or (not media_type and bool(video_url))
+        source = video_url if is_video else image_url
+        if not source and not file_path:
+            return ToolResult.error(
+                f"{slug_label} failed: provide 'url'/'image_url' (public image), "
+                "'video_url', or 'file_path' (local media file)."
+            )
+
+        try:
+            pages_payload = await self.client.request(
+                "POST",
+                "/tools/execute/FACEBOOK_GET_USER_PAGES",
+                json_body={"user_id": user_id, "arguments": {}},
+            )
+        except ComposioError as exc:
+            return ToolResult.error(f"Could not list Facebook pages to publish the story: {exc}")
+
+        page_token = None
+        root = pages_payload.get("data")
+        if isinstance(root, dict) and isinstance(root.get("response_data"), dict):
+            root = root.get("response_data", {})
+        pages = root.get("data", []) if isinstance(root, dict) else []
+        for page in pages if isinstance(pages, list) else []:
+            if str(page.get("id")) == page_id:
+                page_token = page.get("access_token")
+                break
+        if not page_token:
+            return ToolResult.error(
+                f"No Page access token found for Facebook page '{page_id}' for user '{user_id}'. "
+                "Make sure the connected account manages this page, then retry."
+            )
+
+        try:
+            if is_video:
+                async with httpx.AsyncClient(timeout=120.0) as http:
+                    media_response = await http.get(source or file_path)
+                    media_response.raise_for_status()
+                    media_bytes = media_response.content
+                filename = os.path.basename(file_path or "") or "story.mp4"
+                upload_body: dict[str, Any] = {"access_token": page_token, "published": "false"}
+                async with httpx.AsyncClient(timeout=300.0) as http:
+                    response = await http.post(
+                        f"{_FACEBOOK_GRAPH_BASE}/{page_id}/videos",
+                        data=upload_body,
+                        files={"source": (filename, media_bytes)},
+                    )
+                result_upload: dict[str, Any] = response.json()
+                media_key = "video_id"
+            elif file_path and not image_url:
+                with open(file_path, "rb") as fh:  # noqa: ASYNC230 - small local image files only
+                    async with httpx.AsyncClient(timeout=60.0) as http:
+                        response = await http.post(
+                            f"{_FACEBOOK_GRAPH_BASE}/{page_id}/photos",
+                            data={"access_token": page_token, "published": "false"},
+                            files={"source": (os.path.basename(file_path), fh)},
+                        )
+                result_upload = response.json()
+                media_key = "photo_id"
+            else:
+                result_upload = await self.client.post_url(
+                    f"{_FACEBOOK_GRAPH_BASE}/{page_id}/photos",
+                    {"access_token": page_token, "published": "false", "url": str(image_url)},
+                )
+                media_key = "photo_id"
+
+            media_id = str(result_upload.get("id") or "")
+            if not media_id:
+                return ToolResult.error(
+                    f"{slug_label} failed: could not upload the story media: {result_upload}"
+                )
+            result = await self.client.post_url(
+                f"{_FACEBOOK_GRAPH_BASE}/{page_id}/stories",
+                {"access_token": page_token, media_key: media_id},
+            )
+        except ComposioError as exc:
+            return ToolResult.error(f"{slug_label} failed: {exc}")
+        except OSError as exc:
+            return ToolResult.error(f"{slug_label} failed: could not read '{file_path}': {exc}")
+        return _truncate(result)
+
+    async def _facebook_get_page_posts(self, user_id: str, args: dict[str, Any]) -> Any:
+        """Read a Facebook Page's posts using the Page's own access token.
+
+        Composio's native FACEBOOK_GET_PAGE_POSTS authenticates with the
+        connection's user-level token, which the modern Pages API rejects
+        (#190) even for reads; the Page token works.
+        """
+        page_id = str(args.get("page_id") or "").strip()
+        if not page_id:
+            return ToolResult.error("'page_id' is required to read Facebook Page posts.")
+
+        try:
+            pages_payload = await self.client.request(
+                "POST",
+                "/tools/execute/FACEBOOK_GET_USER_PAGES",
+                json_body={"user_id": user_id, "arguments": {}},
+            )
+        except ComposioError as exc:
+            return ToolResult.error(f"Could not list Facebook pages to read posts: {exc}")
+
+        page_token = None
+        root = pages_payload.get("data")
+        if isinstance(root, dict) and isinstance(root.get("response_data"), dict):
+            root = root.get("response_data", {})
+        pages = root.get("data", []) if isinstance(root, dict) else []
+        for page in pages if isinstance(pages, list) else []:
+            if str(page.get("id")) == page_id:
+                page_token = page.get("access_token")
+                break
+        if not page_token:
+            return ToolResult.error(
+                f"No Page access token found for Facebook page '{page_id}' for user '{user_id}'. "
+                "Make sure the connected account manages this page, then retry."
+            )
+
+        limit = max(1, min(int(args.get("limit") or 10), 100))
+        fields = str(
+            args.get("fields")
+            or "id,message,created_time,permalink_url,is_published"
+        )
+        params: dict[str, Any] = {
+            "access_token": page_token,
+            "fields": fields,
+            "limit": str(limit),
+        }
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as http:
+                response = await http.get(f"{_FACEBOOK_GRAPH_BASE}/{page_id}/posts", params=params)
+            result: dict[str, Any] = response.json()
+        except ComposioError as exc:
+            return ToolResult.error(f"FACEBOOK_GET_PAGE_POSTS failed: {exc}")
         return _truncate(result)
 
 
