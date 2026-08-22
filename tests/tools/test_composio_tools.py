@@ -440,6 +440,83 @@ async def test_facebook_photo_post_requires_an_image() -> None:
     assert not fake.calls
 
 
+async def test_facebook_create_story_uses_the_page_access_token() -> None:
+    tool, fake = _tool(ComposioExecuteTool, [_PAGES_PAYLOAD])
+    posted: list[dict[str, Any]] = []
+    tool.client.post_url = _post_url_fake(posted)  # type: ignore[method-assign]
+
+    result = await tool.execute(
+        tool_slug="FACEBOOK_CREATE_STORY",
+        arguments={
+            "page_id": "1192699313930831",
+            "url": "https://cdn.example.com/story.png",
+        },
+    )
+
+    assert fake.calls[0]["path"] == "/tools/execute/FACEBOOK_GET_USER_PAGES"
+    assert len(posted) == 2
+    assert posted[0]["published"] == "false"
+    assert posted[0]["url"] == "https://cdn.example.com/story.png"
+    assert posted[1]["photo_id"] == "1192699313930831_feed_1"
+    assert "page-token-abc" not in result
+
+
+async def test_facebook_create_story_requires_media() -> None:
+    tool, fake = _tool(ComposioExecuteTool, [])
+
+    result = await tool.execute(
+        tool_slug="facebook_create_story",
+        arguments={"page_id": "1192699313930831"},
+    )
+
+    assert result.is_error
+    assert "url" in result
+    assert not fake.calls
+
+
+async def test_facebook_get_page_posts_uses_the_page_access_token(monkeypatch: Any) -> None:
+    import httpx
+
+    tool, fake = _tool(ComposioExecuteTool, [_PAGES_PAYLOAD])
+    captured: dict[str, Any] = {}
+
+    class _FakeResponse:
+        def json(self) -> dict[str, Any]:
+            return {"data": [{"id": "1192699313930831_1", "message": "hello"}]}
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class _FakeAsyncClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, *args: Any) -> bool:
+            return False
+
+        async def get(self, url: str, params: dict[str, Any] | None = None) -> _FakeResponse:
+            captured["url"] = url
+            captured["params"] = params or {}
+            return _FakeResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+
+    result = await tool.execute(
+        tool_slug="FACEBOOK_GET_PAGE_POSTS",
+        arguments={"page_id": "1129160526949038", "limit": 5},
+    )
+
+    assert fake.calls[0]["path"] == "/tools/execute/FACEBOOK_GET_USER_PAGES"
+    assert captured["url"].endswith("/1129160526949038/posts")
+    assert captured["params"]["access_token"] == "page-token-xyz"
+    assert captured["params"]["limit"] == "5"
+    assert "1192699313930831_1" in result
+    assert "page-token-xyz" not in result
+
+
 # --- connect ----------------------------------------------------------------
 
 
