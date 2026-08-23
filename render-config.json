@@ -1,1 +1,121 @@
-@render-config.json
+{
+  "agents": {
+    "defaults": {
+      "model": "agnes-2.5-flash",
+      "provider": "agnes",
+      "maxTokens": 16384,
+      "contextWindowTokens": 200000,
+      "fallbackModels": [
+        {
+          "model": "gemini-3.6-flash",
+          "provider": "gemini",
+          "maxTokens": 16384
+        },
+        {
+          "model": "gemini-3.5-flash",
+          "provider": "gemini",
+          "maxTokens": 16384
+        }
+      ],
+      "timezone": "Africa/Porto-Novo",
+      "timezoneMode": "manual",
+      "botName": "nanobot",
+      "unifiedSession": true
+    }
+  },
+  "providers": {
+    "agnes": {
+      "apiKey": "${AGNES_API_KEY}",
+      "apiBase": "https://apihub.agnes-ai.com/v1"
+    },
+    "gemini": {
+      "apiKey": "${GEMINI_API_KEY}"
+    },
+    "anthropic": {
+      "apiKey": "${ANTHROPIC_API_KEY}"
+    }
+  },
+  "gateway": {
+    "host": "127.0.0.1",
+    "port": 18790
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "token": "${TELEGRAM_BOT_TOKEN}",
+      "mode": "polling",
+      "allowFrom": [
+        "${TELEGRAM_OWNER_ID}"
+      ],
+      "groupPolicy": "mention",
+      "streaming": true,
+      "replyToMessage": true
+    },
+    "websocket": {
+      "enabled": true,
+      "host": "0.0.0.0",
+      "port": 8765,
+      "tokenIssueSecret": "${NANOBOT_WEB_TOKEN}",
+      "websocketRequiresToken": true
+    }
+  },
+  "tools": {
+    "restrictToWorkspace": true,
+    "webuiAllowRemotePackageInstall": false,
+    "my": {
+      "allowSet": false
+    },
+    "composio": {
+      "apiKey": "${COMPOSIO_API_KEY}",
+      "userId": "${COMPOSIO_USER_ID}"
+    }
+  },
+  "cron": {
+    "enabled": true,
+    "pruneRemoved": true,
+    "declarations": [
+      {
+        "id": "daily-brief",
+        "name": "Brief quotidien",
+        "cron": "0 8 * * *",
+        "timezone": "Africa/Porto-Novo",
+        "channel": "telegram",
+        "to": "${TELEGRAM_OWNER_ID}",
+        "message": "Prépare le brief du matin : consulte mes emails non lus et mon agenda du jour via les outils Composio connectés, puis envoie un résumé court en français — les messages qui attendent une réponse, les rendez-vous du jour, et ce qui est urgent. Si aucun compte n'est encore connecté, dis-le en une ligne au lieu d'inventer."
+      },
+      {
+        "id": "composio-connection-health",
+        "name": "Santé des connexions Composio",
+        "cron": "0 9 * * 1",
+        "timezone": "Africa/Porto-Novo",
+        "channel": "telegram",
+        "to": "${TELEGRAM_OWNER_ID}",
+        "message": "Vérifie l'état des comptes Composio connectés avec l'outil de diagnostic des connexions. Signale en français uniquement ce qui nécessite une action : comptes déconnectés, autorisations expirées, ou aucune connexion active. Si tout est sain, réponds en une seule phrase."
+      }
+    ]
+  },
+  "persistence": {
+    "supabase": {
+      "enabled": true,
+      "url": "${SUPABASE_URL}",
+      "serviceKey": "${SUPABASE_SERVICE_KEY}",
+      "table": "nanobot_state_blobs",
+      "paths": [
+        "cron/jobs.json",
+        "data:auth/mcp.json"
+      ],
+      "restoreOnStart": true,
+      "snapshotIntervalS": 300,
+      "treeEnabled": true,
+      "treeKey": "state/data-tree",
+      "treeSnapshotIntervalS": 300,
+      "treeMaxBytes": 40000000
+    },
+    "keepalive": {
+      "enabled": true,
+      "path": "/",
+      "intervalS": 300,
+      "timeoutS": 30
+    }
+  }
+}

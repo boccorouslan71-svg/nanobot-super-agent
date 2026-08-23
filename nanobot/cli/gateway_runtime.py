@@ -1,1 +1,1222 @@
-@nanobot/cli/gateway_runtime.py
+"""Foreground gateway runtime and lifecycle helpers."""
+
+import asyncio
+import signal
+from collections.abc import Awaitable, Callable, Coroutine, Iterable
+from contextlib import suppress
+from pathlib import Path
+from typing import Any, cast
+
+import typer
+from loguru import logger
+from rich.console import Console
+
+from nanobot import __logo__, __version__
+from nanobot.agent.hooks import create_file_edit_activity_hook
+from nanobot.agent.loop import AgentLoop
+from nanobot.agent.tools.mcp import MCPProvider
+from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.cli import terminal as cli_terminal
+from nanobot.cli.runtime_config import _migrate_cron_store
+from nanobot.cli.webui_support import (
+    _gateway_health_bind_note,
+    _gateway_health_url,
+    _host_for_local_browser,
+    _prepare_webui_bundle_for_gateway,
+    _print_foreground_port_conflict,
+    _tcp_endpoint_reachable,
+    _webui_browser_url,
+    _webui_channel_enabled,
+    _webui_display_url,
+    _webui_endpoint_reachable,
+)
+from nanobot.config.paths import is_default_workspace
+from nanobot.config.schema import Config
+from nanobot.gateway.runtime import GatewayInstance
+from nanobot.security.network import is_loopback_host
+from nanobot.session.keys import UNIFIED_SESSION_KEY, last_channel_from_metadata
+from nanobot.utils.evaluator import evaluate_response, resolve_evaluator_prompt
+from nanobot.utils.helpers import sync_workspace_templates
+from nanobot.webui.build import BuildMode
+from nanobot.webui.dev import WebUIDevError, WebUIDevServer
+from nanobot.webui.sidebar_state import read_webui_sidebar_state
+
+__all__ = ["_run_gateway"]
+
+console = Console()
+
+
+def _http_endpoint_responding(url: str, *, timeout_s: float = 0.25) -> bool:
+    """Return whether an HTTP endpoint responds, including with an auth error."""
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_s):
+            return True
+    except urllib.error.HTTPError:
+        return True
+    except (OSError, urllib.error.URLError, TimeoutError, ValueError):
+        return False
+
+
+async def _watch_webui_dev_server(
+    server: WebUIDevServer,
+    shutdown_event: asyncio.Event,
+    *,
+    poll_interval_s: float = 0.2,
+) -> None:
+    """Fail the foreground gateway when its owned Vite sidecar exits."""
+    while not shutdown_event.is_set():
+        await asyncio.sleep(poll_interval_s)
+        if shutdown_event.is_set():
+            return
+        server.ensure_running()
+
+
+def _signal_name(signum: int) -> str:
+    with suppress(ValueError):
+        return signal.Signals(signum).name
+    return f"signal {signum}"
+
+
+def _install_gateway_shutdown_handlers(
+    loop: asyncio.AbstractEventLoop,
+    shutdown_event: asyncio.Event,
+    tasks: list[asyncio.Task[Any]],
+    print_status: Callable[[str], None],
+) -> Callable[[], None]:
+    """Install foreground gateway signal handlers and return a restore callback."""
+    loop_signals: list[int] = []
+    previous_handlers: list[tuple[int, Any]] = []
+    shutdown_requested = False
+
+    def request_shutdown(signum: int) -> None:
+        nonlocal shutdown_requested
+        sig_name = _signal_name(signum)
+        if shutdown_requested:
+            logger.warning("Forcing gateway shutdown after repeated {}", sig_name)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            return
+        shutdown_requested = True
+        logger.info("Gateway shutdown requested by {}", sig_name)
+        print_status("\nShutting down... Press Ctrl+C again to force.")
+        shutdown_event.set()
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(signum, request_shutdown, signum)
+        except (NotImplementedError, RuntimeError, ValueError):
+            try:
+                previous = signal.getsignal(signum)
+                signal.signal(signum, lambda sig, _frame: request_shutdown(sig))
+            except (RuntimeError, ValueError):
+                logger.debug("Could not install gateway handler for {}", _signal_name(signum))
+                continue
+            previous_handlers.append((signum, previous))
+        else:
+            loop_signals.append(signum)
+
+    def restore() -> None:
+        for signum in loop_signals:
+            with suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.remove_signal_handler(signum)
+        for signum, handler in previous_handlers:
+            with suppress(RuntimeError, ValueError):
+                signal.signal(signum, handler)
+
+    return restore
+
+
+def _advance_dream_cursor_if_behind(memory: Any) -> None:
+    latest = memory.get_latest_cursor()
+    if memory.get_last_dream_cursor() < latest:
+        memory.set_last_dream_cursor(latest)
+
+
+def _commit_dream_changes(memory: Any) -> str | None:
+    """Commit durable Dream edits, without entering the commit path for a no-op run."""
+    if not memory.git.is_initialized():
+        return None
+    diff_body = memory.dream_content_diff()
+    if not diff_body:
+        return None
+    message = memory.build_dream_commit_message(
+        "dream: periodic memory consolidation",
+        diff_body,
+    )
+    return memory.git.auto_commit(message)
+
+
+_HEARTBEAT_PREAMBLE = (
+    "[Your response will be delivered directly to the user's messaging app. "
+    "Output ONLY the final user-facing message. Never reference internal "
+    "files (HEARTBEAT.md, AWARENESS.md, etc.), your instructions, or your "
+    "decision process. If nothing needs reporting, respond with just "
+    "'All clear.' and nothing else.]\n\n"
+)
+
+
+def _heartbeat_has_active_tasks(content: str) -> bool:
+    """True if HEARTBEAT.md has task lines, ignoring headers, blanks and comments."""
+    in_comment = False
+    in_active_section: bool = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if in_comment:
+            if "-->" in stripped:
+                in_comment = False
+            continue
+        if not stripped or stripped.startswith("#"):
+            if stripped.startswith("##") and not stripped.startswith("###"):
+                heading = stripped.lstrip("#").strip().lower()
+                in_active_section = heading.startswith("active tasks")
+            continue
+        if stripped.startswith("<!--"):
+            if "-->" not in stripped[4:]:
+                in_comment = True
+            continue
+        if in_active_section is False:
+            continue
+        return True
+    return False
+
+
+def _pick_heartbeat_target_from_sessions(
+    *,
+    enabled_channels: Iterable[str],
+    sessions: Iterable[dict[str, Any]],
+    archived_keys: Iterable[str],
+    unified_session_metadata: dict[str, Any] | None = None,
+) -> tuple[str, str]:
+    enabled = set(enabled_channels)
+    archived = set(archived_keys)
+    for item in sessions:
+        key = item.get("key") or ""
+        if key in archived:
+            continue
+        if key == UNIFIED_SESSION_KEY:
+            route = last_channel_from_metadata(unified_session_metadata)
+            if route is not None:
+                channel, chat_id = route
+                if channel not in {"cli", "system"} and channel in enabled:
+                    return channel, chat_id
+            continue
+        if ":" not in key:
+            continue
+        channel, chat_id = key.split(":", 1)
+        if channel in {"cli", "system"}:
+            continue
+        if channel in enabled and chat_id:
+            return channel, chat_id
+    return "cli", "direct"
+
+
+_GATEWAY_HEALTH_MAX_CONNECTIONS = 64
+_GATEWAY_HEALTH_READ_TIMEOUT_SECONDS = 2.0
+
+
+def _print_gateway_health_endpoint(host: str, port: int) -> None:
+    """Print a usable health URL and make non-loopback binds explicit."""
+    console.print(
+        f"[green]✓[/green] Health endpoint: {_gateway_health_url(host, port)}"
+        f"{_gateway_health_bind_note(host)}"
+    )
+    if is_loopback_host(host):
+        return
+
+    console.print(
+        "[yellow]Warning: the unauthenticated health endpoint is listening beyond loopback "
+        "and may be reachable from other devices. "
+        f"Keep port {port} private or protect it with a firewall or reverse proxy.[/yellow]"
+    )
+
+
+async def _close_gateway_runtime(
+    agent: AgentLoop,
+    mcp_provider: MCPProvider,
+    channels: Any,
+    tasks: list[asyncio.Task[Any]],
+    runtime_tasks: asyncio.Future[list[Any]] | None,
+    *,
+    task_wait_timeout: float = 15.0,
+    close_timeout: float = 15.0,
+) -> None:
+    """Cancel runtime tasks, then deterministically close application resources.
+
+    Order matters: runtime tasks (including the agent loop and any in-flight
+    turn) are cancelled and awaited -- bounded -- before the loop-owned resources
+    and the application-owned MCP provider are torn down. The final close is
+    bounded and idempotent, so it also covers a cancelled or incomplete loop
+    cleanup without leaving subprocess transports alive past ``loop.close()``.
+    """
+    # Some SDKs swallow task cancellation while attempting to reconnect.
+    # Close channel transports before waiting for their runners to exit.
+    await channels.stop_all()
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    pending: set[asyncio.Task[Any]] = set()
+    if tasks:
+        # Bounded: a coroutine that swallows cancellation (e.g. an SDK reconnect
+        # loop) must not hold the stop open until systemd's timeout kills the
+        # cgroup. Anything still pending is abandoned and closed underneath.
+        _done, pending = await asyncio.wait(tasks, timeout=task_wait_timeout)
+        # A task can swallow the first cancellation while unwinding. Re-cancel
+        # timed-out tasks so an agent loop stuck draining background work reaches
+        # its resource-cleanup phase before the explicit final close below.
+        for task in pending:
+            task.cancel()
+    if runtime_tasks is not None and not runtime_tasks.done():
+        runtime_tasks.cancel()
+    for label, close in (
+        ("agent", agent.aclose),
+        ("MCP provider", mcp_provider.aclose),
+    ):
+        try:
+            await asyncio.wait_for(close(), timeout=close_timeout)
+        except BaseException as exc:  # noqa: BLE001 - shutdown must proceed
+            logger.warning("Gateway shutdown: {} cleanup incomplete: {}", label, exc)
+    # Retrieving an already-finished gather prevents noisy unhandled exceptions,
+    # but never wait for it here: its children were bounded individually above.
+    if runtime_tasks is not None and runtime_tasks.done():
+        with suppress(asyncio.CancelledError, Exception):
+            await runtime_tasks
+
+
+def _is_unresolved_placeholder(value: str | None) -> bool:
+    """True when a config value still carries an unresolved ${VAR} placeholder."""
+    return bool(value) and str(value).strip().startswith("${")
+
+
+def _build_state_mirror(config: Any) -> Any | None:
+    """Build the Supabase state mirror when persistence is configured.
+
+    Returns None when the mirror is disabled or its credentials were never
+    injected, so an unset environment degrades to "no mirror" instead of a
+    startup crash or a noisy retry loop.
+    """
+    mirror_cfg = config.persistence.supabase
+    if not mirror_cfg.enabled:
+        return None
+    if _is_unresolved_placeholder(mirror_cfg.url) or _is_unresolved_placeholder(
+        mirror_cfg.service_key
+    ):
+        logger.info("Supabase state mirror: credentials not set; running without it")
+        return None
+
+    from nanobot.persistence import SupabaseStateStore, WorkspaceStateMirror
+
+    store = SupabaseStateStore(
+        url=mirror_cfg.url or "",
+        service_key=mirror_cfg.service_key or "",
+        table=mirror_cfg.table,
+        timeout_s=mirror_cfg.timeout_s,
+    )
+    from nanobot.config.paths import get_data_dir
+
+    return WorkspaceStateMirror(
+        store=store,
+        workspace_path=config.workspace_path,
+        paths=mirror_cfg.paths,
+        # Credential-bearing state (MCP OAuth tokens) lives outside the
+        # workspace, so the mirror needs both roots to cover a cold container.
+        data_path=get_data_dir(),
+    )
+
+
+def _build_tree_mirror(config: Any) -> Any | None:
+    """Build the whole-tree Supabase mirror when persistence is configured.
+
+    Separate from :func:`_build_state_mirror` because the two answer different
+    questions: that one mirrors a known list of JSON documents, this one carries
+    everything else the container would lose — config.json (provider keys and
+    channel settings edited in the WebUI), self-installed skills, workspace
+    files, session history. Same credentials, same table, one archive row.
+    """
+    mirror_cfg = config.persistence.supabase
+    if not mirror_cfg.enabled or not mirror_cfg.tree_enabled:
+        return None
+    if _is_unresolved_placeholder(mirror_cfg.url) or _is_unresolved_placeholder(
+        mirror_cfg.service_key
+    ):
+        return None
+
+    from nanobot.persistence import SupabaseStateStore, TreeArchiveMirror
+
+    store = SupabaseStateStore(
+        url=mirror_cfg.url or "",
+        service_key=mirror_cfg.service_key or "",
+        table=mirror_cfg.table,
+        # The archive is orders of magnitude larger than a JSON document, so it
+        # gets a longer budget than the per-file mirror's default.
+        timeout_s=max(mirror_cfg.timeout_s, 60.0),
+    )
+    from nanobot.config.paths import get_data_dir
+
+    return TreeArchiveMirror(
+        store=store,
+        root=get_data_dir(),
+        key=mirror_cfg.tree_key,
+        excludes=mirror_cfg.tree_excludes,
+        max_bytes=mirror_cfg.tree_max_bytes,
+    )
+
+
+def _build_keepalive(config: Any) -> Any | None:
+    """Build the free-tier self-ping keepalive when it is configured.
+
+    Kept next to the state mirror because both exist for the same reason: a
+    free-tier container host with no persistent disk and an idle-sleep policy.
+    """
+    import os
+
+    from nanobot.persistence import build_keepalive
+
+    return build_keepalive(config, environ=dict(os.environ))
+
+
+async def _restore_pending_state(
+    tree_mirror: Any | None,
+    state_mirror: Any | None,
+    data_dir: Any,
+    *,
+    interval_s: float = 120.0,
+) -> None:
+    """Finish a degraded start in the background, then unfreeze the mirrors.
+
+    Started only when bootstrap placed the restore-pending marker (the pre-start
+    restore exhausted its retries against an unreachable or too-slow Supabase).
+    While that marker exists both mirrors refuse to push, so this container
+    cannot overwrite a healthy mirror with its unverified local tree. This task
+    retries the full restore on a fixed cadence; the first round with zero
+    failures clears the marker and normal snapshot cadence resumes on the next
+    cycle — no restart needed. Losing these retries never takes the agent down:
+    every error is logged and the loop simply tries again.
+    """
+    from nanobot.persistence.restore_gate import clear as clear_restore_marker
+
+    while True:
+        await asyncio.sleep(interval_s)
+        failures = 0
+        restored_counts: list[tuple[str, int]] = []
+        for name, mirror in (("tree", tree_mirror), ("state", state_mirror)):
+            if mirror is None:
+                continue
+            try:
+                count = len(await mirror.restore())
+            except Exception as exc:  # noqa: BLE001 - retry forever, log everything
+                failures += 1
+                logger.warning(
+                    "Degraded start: {}-mirror restore still failing: {}", name, exc
+                )
+                continue
+            restored_counts.append((name, count))
+        if failures:
+            continue
+        for name, count in restored_counts:
+            logger.info("Degraded start: {}-mirror restored {} file(s)", name, count)
+        clear_restore_marker(Path(data_dir))
+        logger.info(
+            "Degraded start resolved: full mirror restored — snapshots resume "
+            "on their next cycle"
+        )
+        return
+
+
+def _run_gateway(
+    config: Config,
+    *,
+    port: int | None = None,
+    open_browser_url: str | None = None,
+    open_browser_ready_url: str | None = None,
+    webui_static_dist: bool = True,
+    webui_bundle_mode: BuildMode = "warn",
+    webui_runtime_surface: str = "browser",
+    webui_runtime_capabilities: dict[str, Any] | None = None,
+    health_server_enabled: bool = True,
+    unconfigured_provider_error: str | None = None,
+    webui_dev_server: WebUIDevServer | None = None,
+    gateway_instance: GatewayInstance | None = None,
+) -> None:
+    """Shared gateway runtime; ``open_browser_url`` opens a tab once channels are up."""
+    from nanobot.agent.model_presets import load_model_preset_catalog
+    from nanobot.agent.tools.message import MessageTool
+    from nanobot.agent.turn_delivery import TurnDeliveryFactory
+    from nanobot.bus.queue import MessageBus
+    from nanobot.bus.runtime_events import RuntimeEventBus
+    from nanobot.channels.manager import ChannelManager
+    from nanobot.config.watcher import watch_config_file
+    from nanobot.cron.bound_runner import run_bound_cron_job
+    from nanobot.cron.service import CronJobSkippedError, CronService
+    from nanobot.cron.session_turns import is_bound_cron_job
+    from nanobot.cron.types import CronJob
+    from nanobot.providers.factory import (
+        ProviderSnapshot,
+        build_provider_snapshot,
+        build_unconfigured_provider_snapshot,
+        load_provider_snapshot,
+    )
+    from nanobot.providers.fallback_provider import FallbackProvider
+    from nanobot.providers.image_generation import image_gen_provider_configs
+    from nanobot.session.manager import SessionManager
+    from nanobot.session.webui_turns import (
+        WebuiTurnCoordinator,
+        WebuiTurnRoutePolicy,
+        build_webui_fallback_model_observer,
+    )
+    from nanobot.triggers.local_runner import run_local_trigger_queue
+    from nanobot.triggers.local_store import LocalTriggerStore
+    from nanobot.webui.token_usage import TokenUsageHook
+
+    port = port if port is not None else config.gateway.port
+    webui_url = _webui_browser_url(config)
+    gateway_host_for_browser = _host_for_local_browser(config.gateway.host)
+    if health_server_enabled and _tcp_endpoint_reachable(gateway_host_for_browser, port):
+        _print_foreground_port_conflict(
+            webui_url=webui_url,
+            gateway_host=config.gateway.host,
+            gateway_port=port,
+        )
+        raise typer.Exit(1)
+    if _webui_channel_enabled(config) and _webui_endpoint_reachable(webui_url):
+        _print_foreground_port_conflict(
+            webui_url=webui_url,
+            gateway_host=config.gateway.host,
+            gateway_port=port,
+        )
+        raise typer.Exit(1)
+
+    console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
+    _prepare_webui_bundle_for_gateway(
+        config,
+        mode=webui_bundle_mode,
+        webui_static_dist=webui_static_dist,
+    )
+    sync_workspace_templates(config.workspace_path)
+    bus = MessageBus()
+    runtime_events = RuntimeEventBus()
+    fallback_model_observer = build_webui_fallback_model_observer(bus)
+
+    def _observe_fallback_models(snapshot: ProviderSnapshot) -> ProviderSnapshot:
+        if isinstance(snapshot.provider, FallbackProvider):
+            snapshot.provider.set_fallback_model_observer(fallback_model_observer)
+        return snapshot
+
+    def _load_gateway_provider_snapshot(
+        *args: Any,
+        **kwargs: Any,
+    ) -> ProviderSnapshot:
+        try:
+            return _observe_fallback_models(load_provider_snapshot(*args, **kwargs))
+        except ValueError as exc:
+            if unconfigured_provider_error is None:
+                raise
+            return build_unconfigured_provider_snapshot(config, str(exc))
+
+    if unconfigured_provider_error is not None:
+        provider_snapshot = build_unconfigured_provider_snapshot(
+            config,
+            unconfigured_provider_error,
+        )
+    else:
+        try:
+            provider_snapshot = _observe_fallback_models(build_provider_snapshot(config))
+        except ValueError as exc:
+            console.print(f"[red]Error: {exc}[/red]")
+            raise typer.Exit(1) from exc
+    session_manager = SessionManager(config.workspace_path)
+
+    # Use the same runtime identity for foreground and managed gateway processes.
+    from nanobot.config.loader import get_config_path
+    from nanobot.gateway.runtime import (
+        GatewayClientLease,
+        GatewayRuntime,
+        monitor_gateway_clients,
+    )
+
+    instance = gateway_instance or GatewayInstance.resolve(
+        config_path=get_config_path(),
+    )
+    config_path = str(instance.config_path)
+    gateway_runtime = GatewayRuntime(paths=instance.paths)
+    gateway_start_options = instance.start_options(port=port)
+
+    # Preserve existing single-workspace installs, but keep custom workspaces clean.
+    if is_default_workspace(config.workspace_path):
+        _migrate_cron_store(config)
+
+    # Restore mirrored runtime state before anything reads the cron store.
+    # On hosts without a persistent disk the workspace is empty on boot; the
+    # mirror repopulates it so scheduled jobs and sessions survive a redeploy.
+    state_mirror = _build_state_mirror(config)
+    tree_mirror = _build_tree_mirror(config)
+    keepalive = _build_keepalive(config)
+    if keepalive is not None:
+        console.print(
+            f"[green]✓[/green] Keepalive: {keepalive.url} "
+            f"every {keepalive.interval_s:.0f}s"
+        )
+    if state_mirror is not None and config.persistence.supabase.restore_on_start:
+        from nanobot.persistence import SupabasePersistenceError
+
+        try:
+            restored_paths = asyncio.run(state_mirror.restore())
+        except SupabasePersistenceError as exc:
+            console.print(f"[yellow]○[/yellow] Supabase state restore skipped: {exc}[/yellow]")
+        else:
+            if restored_paths:
+                console.print(
+                    f"[green]✓[/green] Supabase state restored: {', '.join(restored_paths)}"
+                )
+            else:
+                console.print("[green]✓[/green] Supabase state mirror: local state is current")
+
+    if tree_mirror is not None and config.persistence.supabase.restore_on_start:
+        from nanobot.persistence import SupabasePersistenceError
+
+        # entrypoint.sh already ran this before the config was loaded, which is
+        # the only way config.json itself can be restored in time. Running it
+        # again here covers every other start path (local Docker, `nanobot
+        # gateway` by hand) and is a no-op when the tree is already complete.
+        try:
+            restored_files = asyncio.run(tree_mirror.restore())
+        except SupabasePersistenceError as exc:
+            console.print(f"[yellow]○[/yellow] Supabase tree restore skipped: {exc}")
+        else:
+            if restored_files:
+                console.print(
+                    f"[green]✓[/green] Supabase tree restored: {len(restored_files)} file(s)"
+                )
+            else:
+                console.print("[green]✓[/green] Supabase tree mirror: local tree is current")
+
+    # Degraded start: bootstrap exhausted its retries against Supabase before
+    # boot (restore-pending marker). Both mirrors freeze their pushes while the
+    # marker exists; a background task keeps restoring until it succeeds.
+    from nanobot.config.paths import get_data_dir as _gateway_data_dir
+
+    from nanobot.persistence.restore_gate import is_held as restore_pending
+
+    degraded_start = (
+        (tree_mirror is not None or state_mirror is not None)
+        and config.persistence.supabase.enabled
+        and restore_pending(_gateway_data_dir())
+    )
+    if degraded_start:
+        console.print(
+            "[red]![/red] Degraded start: pre-boot state restore failed — "
+            "snapshots frozen so the mirror cannot be overwritten"
+        )
+
+    # Create cron service with workspace-scoped store
+    cron_store_path = config.workspace_path / "cron" / "jobs.json"
+    cron = CronService(cron_store_path)
+    trigger_store = LocalTriggerStore(config.workspace_path)
+
+    turn_delivery_factory = TurnDeliveryFactory(
+        bus,
+        runtime_events,
+        route_policy=WebuiTurnRoutePolicy(session_manager),
+    )
+
+    tools = ToolRegistry()
+    # Installed CLI apps live in their own environment, whose bin dir is not on
+    # this process's PATH. Publish it before MCP starts: an MCP stdio server
+    # shipped by an app is spawned by command name, and an unresolvable command
+    # there used to cost a full connection timeout at every boot.
+    with suppress(Exception):
+        from nanobot.apps.cli.service import CliAppManager
+
+        CliAppManager(workspace=config.workspace_path).expose_env_on_path()
+    mcp_provider = MCPProvider.from_config(config, tools)
+
+    # Create agent with cron service
+    agent = AgentLoop.from_config(
+        config, bus,
+        provider=provider_snapshot.provider,
+        model=provider_snapshot.model,
+        context_window_tokens=provider_snapshot.context_window_tokens,
+        cron_service=cron,
+        session_manager=session_manager,
+        image_generation_provider_configs=image_gen_provider_configs(config),
+        provider_snapshot_loader=_load_gateway_provider_snapshot,
+        preset_catalog_loader=load_model_preset_catalog,
+        runtime_events=runtime_events,
+        turn_delivery_factory=turn_delivery_factory,
+        provider_signature=provider_snapshot.signature,
+        hooks=[TokenUsageHook(timezone_name=config.agents.defaults.timezone)],
+        local_trigger_store=trigger_store,
+        hook_factories=[create_file_edit_activity_hook],
+        tool_registry=tools,
+    )
+    def _schedule_webui_background(awaitable: Awaitable[None]) -> None:
+        agent.schedule_background(cast(Coroutine[Any, Any, None], awaitable))
+
+    webui_turn_coordinator = WebuiTurnCoordinator(
+        bus=bus,
+        sessions=session_manager,
+        schedule_background=_schedule_webui_background,
+    )
+    webui_turn_coordinator.subscribe(runtime_events)
+    from nanobot.bus.events import OutboundMessage
+    from nanobot.session.keys import session_key_for_channel
+
+    def _channel_session_key(channel: str, chat_id: str) -> str:
+        return session_key_for_channel(
+            channel,
+            chat_id,
+            unified_session=config.agents.defaults.unified_session,
+        )
+
+    async def _deliver_to_channel(
+        msg: OutboundMessage, *, record: bool = False, session_key: str | None = None,
+    ) -> None:
+        """Publish a user-visible message and mirror it into that channel's session."""
+        metadata = dict(msg.metadata or {})
+        record = record or bool(metadata.pop("_record_channel_delivery", False))
+        if metadata != (msg.metadata or {}):
+            msg = OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=msg.content,
+                reply_to=msg.reply_to,
+                media=msg.media,
+                metadata=metadata,
+                buttons=msg.buttons,
+            )
+        if (
+            record
+            and msg.channel != "cli"
+            and msg.content.strip()
+            and hasattr(session_manager, "get_or_create")
+            and hasattr(session_manager, "save")
+        ):
+            key = session_key or _channel_session_key(msg.channel, msg.chat_id)
+            session = session_manager.get_or_create(key)
+            extra: dict[str, Any] = {"_channel_delivery": True}
+            if msg.media:
+                extra["media"] = list(msg.media)
+            session.add_message("assistant", msg.content, **extra)
+            session_manager.save(session)
+        await bus.publish_outbound(msg)
+
+    message_tool = agent.tools.get("message")
+    if isinstance(message_tool, MessageTool):
+        message_tool.set_send_callback(_deliver_to_channel)
+
+    # Set cron callback (needs agent)
+    async def on_cron_job(job: CronJob) -> str | None:
+        """Execute a cron job through the agent."""
+        async def _silent(*_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        # Dream is an internal job — run directly, not through the agent loop.
+        if job.name == "dream":
+            from nanobot.agent.memory import DreamRunProgress, MemoryStore
+
+            dream_session_key = MemoryStore.dream_session_key
+            prune_dream_sessions = MemoryStore.prune_dream_sessions
+
+            store = agent.context.memory
+            progress = DreamRunProgress()
+            resp = None
+            diff_body = ""
+            try:
+                result = store.build_dream_prompt()
+                if result is None:
+                    logger.info("Dream: nothing to process")
+                    return None
+                prompt, last_cursor = result
+                key = dream_session_key()
+                dream_runtime = agent.dream_runtime()
+                await mcp_provider.connect()
+                resp = await agent.process_direct(
+                    prompt,
+                    session_key=key,
+                    ephemeral=True,
+                    tools=store.build_dream_tools(),
+                    on_progress=progress,
+                    runtime=dream_runtime,
+                )
+                # The real file delta grounds the audit record; clean completion
+                # decides whether this history batch has finished processing.
+                diff_body = store.dream_content_diff()
+                completed = MemoryStore.dream_run_completed(
+                    resp,
+                    had_tool_errors=progress.had_tool_errors,
+                )
+                if completed:
+                    store.set_last_dream_cursor(last_cursor)
+                    if diff_body:
+                        logger.info(
+                            "Dream cron job completed, cursor advanced to {}",
+                            last_cursor,
+                        )
+                    else:
+                        logger.info(
+                            "Dream cron job completed with no memory changes; "
+                            "cursor advanced to {}",
+                            last_cursor,
+                        )
+                else:
+                    logger.warning(
+                        "Dream cron job did not complete; cursor remains at {}",
+                        store.get_last_dream_cursor(),
+                    )
+            except Exception:
+                logger.exception("Dream cron job failed")
+            finally:
+                from nanobot.webui.token_usage import record_response_token_usage
+
+                record_response_token_usage(
+                    resp,
+                    source="dream",
+                    timezone_name=config.agents.defaults.timezone,
+                )
+                sha = _commit_dream_changes(store)
+                if sha:
+                    logger.info("Dream commit: {}", sha)
+                store.compact_history()
+                prune_dream_sessions(agent.sessions)
+            return None
+
+        # Heartbeat is a system job that checks HEARTBEAT.md for active tasks.
+        if job.name == "heartbeat":
+            heartbeat_file = config.workspace_path / "HEARTBEAT.md"
+            try:
+                content = heartbeat_file.read_text(encoding="utf-8")
+            except OSError:
+                logger.debug("Heartbeat: HEARTBEAT.md missing")
+                return None
+            if not _heartbeat_has_active_tasks(content):
+                logger.debug("Heartbeat: HEARTBEAT.md has no active tasks")
+                return None
+
+            channel, chat_id = _pick_heartbeat_target()
+            if channel == "cli":
+                return None
+
+            prompt = (
+                _HEARTBEAT_PREAMBLE
+                + f"You are executing periodic heartbeat tasks. Read the active tasks below, perform each one, and report what you did:\n\n{content}"
+            )
+
+            # Internal check: funnel all output through the post-run gate so the
+            # turn can't deliver directly via the message tool and skip it.
+            suppress_token = None
+            if isinstance(message_tool, MessageTool):
+                suppress_token = message_tool.set_suppress_delivery(True)
+            try:
+                await mcp_provider.connect()
+                resp = await agent.process_direct(
+                    prompt,
+                    session_key="heartbeat",
+                    channel=channel,
+                    chat_id=chat_id,
+                    on_progress=_silent,
+                )
+            finally:
+                if isinstance(message_tool, MessageTool) and suppress_token is not None:
+                    message_tool.reset_suppress_delivery(suppress_token)
+
+            # Keep a small tail of heartbeat history so the loop stays bounded.
+            session = agent.sessions.get_or_create("heartbeat")
+            session.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
+            agent.sessions.save(session)
+
+            if not resp or not resp.content:
+                return
+
+            response = resp.content
+
+            evaluator_prompt = resolve_evaluator_prompt(config.workspace_path)
+
+            # Fail closed: stay silent on evaluator failure instead of notifying.
+            should_notify = await evaluate_response(
+                response=response,
+                task_context=prompt,
+                provider=agent.provider,
+                model=agent.model,
+                evaluator_prompt=evaluator_prompt,
+                default_notify=False,
+            )
+
+            if should_notify:
+                logger.info("Heartbeat: completed, delivering response")
+                await _deliver_to_channel(
+                    OutboundMessage(channel=channel, chat_id=chat_id, content=response),
+                    record=True,
+                )
+            else:
+                logger.info("Heartbeat: silenced by post-run evaluation")
+            return response
+
+        if is_bound_cron_job(job):
+            return await run_bound_cron_job(job, agent=agent, cron=cron)
+
+        reason = "unbound agent cron job must be recreated from a chat session"
+        logger.warning(
+            "Cron: skipped unbound agent job '{}' ({}): {}",
+            job.name,
+            job.id,
+            reason,
+        )
+        raise CronJobSkippedError(reason)
+
+    cron.on_job = on_cron_job
+
+    def _webui_runtime_model_name() -> str | None:
+        return agent.model.strip() or None
+
+    def _webui_refresh_runtime_config() -> None:
+        agent.refresh_runtime_config()
+
+    def _webui_skill_state_action(disabled_skills: set[str]) -> None:
+        config.agents.defaults.disabled_skills = sorted(disabled_skills)
+        agent.context.skills.disabled_skills = set(disabled_skills)
+        agent.subagents.disabled_skills = set(disabled_skills)
+
+    # Create channel manager (forwards SessionManager so the WebSocket channel
+    # can serve the embedded webui's REST surface).
+    channels = ChannelManager(
+        config,
+        bus,
+        session_manager=session_manager,
+        cron_service=cron,
+        local_trigger_store=trigger_store,
+        webui_runtime_model_name=_webui_runtime_model_name,
+        webui_refresh_runtime_config=_webui_refresh_runtime_config,
+        webui_cron_pending_job_ids=agent.pending_cron_job_ids_for_session,
+        webui_local_trigger_pending_ids=agent.pending_local_trigger_ids_for_session,
+        webui_static_dist=webui_static_dist,
+        webui_runtime_surface=webui_runtime_surface,
+        webui_runtime_capabilities=webui_runtime_capabilities,
+        webui_mcp_runtime_status=mcp_provider.runtime_status,
+        webui_mcp_reload=mcp_provider.reload,
+        webui_skill_state_action=_webui_skill_state_action,
+        config_path=Path(config_path),
+    )
+
+    def _pick_heartbeat_target() -> tuple[str, str]:
+        """Pick a routable channel/chat target for heartbeat-triggered messages."""
+        sidebar_state = read_webui_sidebar_state()
+        unified_metadata = None
+        if config.agents.defaults.unified_session:
+            record = session_manager.read_session_metadata(UNIFIED_SESSION_KEY)
+            if isinstance(record, dict) and isinstance(record.get("metadata"), dict):
+                unified_metadata = record["metadata"]
+        return _pick_heartbeat_target_from_sessions(
+            enabled_channels=channels.enabled_channels,
+            sessions=session_manager.list_sessions(),
+            archived_keys=sidebar_state.get("archived_keys", []),
+            unified_session_metadata=unified_metadata,
+        )
+
+    if channels.enabled_channels:
+        console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
+    else:
+        console.print("[yellow]Warning: No channels enabled[/yellow]")
+
+    cron_status = cron.status()
+    cron_job_count = cast(int, cron_status["jobs"])
+    if cron_job_count > 0:
+        console.print(f"[green]✓[/green] Cron: {cron_job_count} scheduled jobs")
+
+    hb_cfg = config.gateway.heartbeat
+    if hb_cfg.enabled:
+        console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
+    else:
+        console.print("[yellow]✗[/yellow] Heartbeat: disabled")
+
+    async def _health_server(host: str, health_port: int) -> None:
+        """Lightweight HTTP health endpoint on the gateway port."""
+        import json as _json
+
+        connection_slots = asyncio.Semaphore(_GATEWAY_HEALTH_MAX_CONNECTIONS)
+
+        async def handle(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            if connection_slots.locked():
+                writer.close()
+                return
+
+            async with connection_slots:
+                try:
+                    data = await asyncio.wait_for(
+                        reader.read(4096),
+                        timeout=_GATEWAY_HEALTH_READ_TIMEOUT_SECONDS,
+                    )
+                    request_line = data.split(b"\r\n", 1)[0].decode(
+                        "utf-8", errors="replace",
+                    )
+                    method, path = "", ""
+                    parts = request_line.split(" ")
+                    if len(parts) >= 2:
+                        method, path = parts[0], parts[1]
+
+                    if method == "GET" and path == "/health":
+                        body = _json.dumps({"status": "ok"})
+                        status = "200 OK"
+                        content_type = "application/json"
+                    else:
+                        body = "Not Found"
+                        status = "404 Not Found"
+                        content_type = "text/plain"
+
+                    resp = (
+                        f"HTTP/1.0 {status}\r\n"
+                        f"Content-Type: {content_type}\r\n"
+                        f"Content-Length: {len(body)}\r\n"
+                        "Connection: close\r\n"
+                        f"\r\n{body}"
+                    )
+                    writer.write(resp.encode())
+                    await writer.drain()
+                except (asyncio.TimeoutError, ConnectionError):
+                    pass
+                finally:
+                    writer.close()
+
+        server = await asyncio.start_server(handle, host, health_port)
+        _print_gateway_health_endpoint(host, health_port)
+        async with server:
+            await server.serve_forever()
+    # Register Dream system job (idempotent on restart)
+    from nanobot.cron.types import CronJob, CronPayload, CronSchedule
+    dream_cfg = config.agents.defaults.dream
+    if dream_cfg.enabled:
+        cron.register_system_job(CronJob(
+            id="dream",
+            name="dream",
+            schedule=dream_cfg.build_schedule(config.agents.defaults.timezone),
+            payload=CronPayload(kind="system_event"),
+        ))
+        console.print(f"[green]✓[/green] Dream: {dream_cfg.describe_schedule()}")
+    else:
+        console.print("[yellow]○[/yellow] Dream: disabled")
+        _advance_dream_cursor_if_behind(agent.context.memory)
+
+    # Register Heartbeat system job (idempotent on restart)
+    if hb_cfg.enabled:
+        cron.register_system_job(CronJob(
+            id="heartbeat",
+            name="heartbeat",
+            schedule=CronSchedule(
+                kind="every",
+                every_ms=hb_cfg.interval_s * 1000,
+                tz=config.agents.defaults.timezone,
+            ),
+            payload=CronPayload(kind="system_event"),
+        ))
+
+    # Re-declare version-controlled cron jobs (idempotent; survives disk loss)
+    from nanobot.cron.bootstrap import bootstrap_declared_cron_jobs
+
+    cron_bootstrap = bootstrap_declared_cron_jobs(cron, config)
+    if not cron_bootstrap.enabled:
+        console.print("[yellow]○[/yellow] Cron declarations: disabled")
+    elif cron_bootstrap.registered or cron_bootstrap.pruned or cron_bootstrap.failed:
+        style = "red" if cron_bootstrap.failed else "green"
+        marker = "✗" if cron_bootstrap.failed else "✓"
+        console.print(
+            f"[{style}]{marker}[/{style}] Cron declarations: {cron_bootstrap.describe()}"
+        )
+        for declaration_id, error in cron_bootstrap.failed.items():
+            console.print(f"  [red]•[/red] {declaration_id}: {error}")
+
+    async def _open_browser_when_ready() -> None:
+        """Wait for the gateway to bind, then point the user's browser at the webui."""
+        if not open_browser_url:
+            return
+        import webbrowser
+        from urllib.parse import urlparse
+
+        # Channels start asynchronously. When the caller supplies a backend
+        # readiness route, wait for an actual HTTP response rather than probing
+        # the WebSocket listener with an incomplete TCP connection.
+        if open_browser_ready_url:
+            for _ in range(40):  # ~4s max per listener
+                if await asyncio.to_thread(
+                    _http_endpoint_responding,
+                    open_browser_ready_url,
+                ):
+                    break
+                await asyncio.sleep(0.1)
+
+        parsed = urlparse(open_browser_url)
+        target_host = parsed.hostname or config.gateway.host or "127.0.0.1"
+        target_port = parsed.port or port
+        for _ in range(40):  # ~4s max
+            try:
+                _reader, writer = await asyncio.open_connection(
+                    target_host,
+                    target_port,
+                )
+                writer.close()
+                with suppress(Exception):
+                    await writer.wait_closed()
+                break
+            except OSError:
+                await asyncio.sleep(0.1)
+        display_url = _webui_display_url(open_browser_url)
+        try:
+            webbrowser.open(open_browser_url)
+            console.print(f"[green]✓[/green] Opened browser at {display_url}")
+        except Exception as e:
+            console.print(f"[yellow]Could not open browser ({e}); visit {display_url}[/yellow]")
+
+    async def run() -> None:
+        tasks: list[asyncio.Task[Any]] = []
+        shutdown_task: asyncio.Task[Any] | None = None
+        runtime_tasks: asyncio.Future[list[Any]] | None = None
+        shutdown_event = asyncio.Event()
+        cli_terminal._ensure_interactive_tty_mode()
+        restore_shutdown_handlers = _install_gateway_shutdown_handlers(
+            asyncio.get_running_loop(),
+            shutdown_event,
+            tasks,
+            console.print,
+        )
+        try:
+            await cron.start()
+            # Re-read once on first admission to close the watcher subscription window.
+            agent.runtime_resolver.invalidate()
+            async def _run_agent() -> None:
+                # Connect on this task rather than a child of it: an MCP session's
+                # exit stack must be closed from the task that entered it, and the
+                # close below runs here. The startup cost is bounded inside the
+                # connect itself -- per-server and batch ceilings, servers
+                # connected concurrently, and an unresolvable stdio launcher
+                # failing fast -- so this no longer serializes one timeout per
+                # server the way it used to.
+                try:
+                    await mcp_provider.connect()
+                    await agent.run()
+                finally:
+                    await mcp_provider.aclose()
+
+            async def _monitor_local_clients() -> None:
+                orphaned = await monitor_gateway_clients(
+                    GatewayClientLease(gateway_runtime, kind="gateway-monitor"),
+                    shutdown_event,
+                )
+                if orphaned:
+                    logger.info("Last local client disappeared; stopping on-demand gateway")
+
+            tasks = [
+                asyncio.create_task(
+                    watch_config_file(
+                        Path(config_path),
+                        lambda: agent.invalidate_runtime_config(),
+                    ),
+                    name="nanobot-config-watcher",
+                ),
+                asyncio.create_task(_run_agent(), name="nanobot-agent-loop"),
+                asyncio.create_task(channels.start_all(), name="nanobot-channels"),
+                asyncio.create_task(
+                    run_local_trigger_queue(
+                        store=trigger_store,
+                        submit_turn=agent.submit_local_trigger_turn,
+                        is_channel_enabled=lambda name: channels.get_channel(name) is not None,
+                    ),
+                    name="nanobot-local-triggers",
+                ),
+                asyncio.create_task(
+                    _monitor_local_clients(),
+                    name="nanobot-gateway-client-monitor",
+                ),
+            ]
+            if state_mirror is not None:
+                tasks.append(asyncio.create_task(
+                    state_mirror.run_forever(config.persistence.supabase.snapshot_interval_s),
+                    name="nanobot-supabase-mirror",
+                ))
+            if tree_mirror is not None:
+                tasks.append(asyncio.create_task(
+                    tree_mirror.run_forever(
+                        config.persistence.supabase.tree_snapshot_interval_s
+                    ),
+                    name="nanobot-supabase-tree-mirror",
+                ))
+            if degraded_start:
+                tasks.append(asyncio.create_task(
+                    _restore_pending_state(
+                        tree_mirror, state_mirror, _gateway_data_dir()
+                    ),
+                    name="nanobot-restore-pending",
+                ))
+            if keepalive is not None:
+                tasks.append(asyncio.create_task(
+                    keepalive.run_forever(),
+                    name="nanobot-keepalive",
+                ))
+            if health_server_enabled:
+                tasks.append(asyncio.create_task(
+                    _health_server(config.gateway.host, port),
+                    name="nanobot-health-server",
+                ))
+            if open_browser_url:
+                tasks.append(asyncio.create_task(
+                    _open_browser_when_ready(),
+                    name="nanobot-open-browser",
+                ))
+            if webui_dev_server is not None:
+                tasks.append(asyncio.create_task(
+                    _watch_webui_dev_server(webui_dev_server, shutdown_event),
+                    name="nanobot-webui-dev-server",
+                ))
+            runtime_tasks = asyncio.gather(*tasks)
+            shutdown_task = asyncio.create_task(
+                shutdown_event.wait(),
+                name="nanobot-gateway-shutdown",
+            )
+            done, _pending = await asyncio.wait(
+                {runtime_tasks, shutdown_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if runtime_tasks in done:
+                await runtime_tasks
+            else:
+                runtime_tasks.cancel()
+        except KeyboardInterrupt:
+            console.print("\nShutting down...")
+        except WebUIDevError:
+            raise
+        except Exception:
+            import traceback
+
+            console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
+            console.print(traceback.format_exc())
+        finally:
+            try:
+                if shutdown_task and not shutdown_task.done():
+                    shutdown_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await shutdown_task
+                cron.stop()
+                agent.stop()
+                # Cancel runtime tasks first, then deterministically close
+                # exec/MCP resources while the event loop is still alive.
+                await _close_gateway_runtime(
+                    agent,
+                    mcp_provider,
+                    channels,
+                    tasks,
+                    runtime_tasks,
+                )
+                # Flush all cached sessions to durable storage before exit.
+                # This prevents data loss on filesystems with write-back
+                # caching (rclone VFS, NFS, FUSE mounts, etc.).
+                flushed = agent.sessions.flush_all()
+                if flushed:
+                    logger.info("Shutdown: flushed {} session(s) to disk", flushed)
+            finally:
+                restore_shutdown_handlers()
+
+    with gateway_runtime.foreground_instance(gateway_start_options):
+        asyncio.run(run())
